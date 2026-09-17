@@ -1,0 +1,42 @@
+REGEDIT4
+
+; Empire Earth Gold — Wine / Apple Silicon compatibility.
+; Applied at prefix setup and each Play. Does not modify game binaries.
+
+[HKEY_CURRENT_USER\Software\Wine\WineDbg]
+"ShowCrashDialog"=dword:00000000
+
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"ddraw"="native"
+"d3dimm"="native"
+"d3d11"="native"
+"d3d10core"="native"
+"dxgi"="native"
+"d3d9"="builtin"
+"wined3d"="builtin"
+"dsound"="builtin"
+"dmusic"="native"
+
+[HKEY_CURRENT_USER\Software\Wine\Direct3D]
+"VideoMemorySize"="2048"
+"renderer"="gl"
+"OffscreenRenderingMode"="backbuffer"
+"csmt"="0"
+
+[HKEY_CURRENT_USER\Software\Wine\Mac Driver]
+"RetinaMode"="n"
+
+[HKEY_CURRENT_USER\Software\SSSI\Empire Earth]
+"Music Enabled"=dword:00000000
+"Game Bit Depth"=dword:00000020
+"Texture Bit Depth"=dword:00000020
+"Wait for VSync"=dword:00000000
+"Game Window Width"=dword:00000320
+"Game Window Height"=dword:00000258
+"Rasterizer Name"="Direct3D Hardware TnL"
+"UseCandidateWindow"=dword:00000000
+
+[HKEY_CURRENT_USER\Software\Mad Doc Software\EE-AOC]
+"Music Enabled"=dword:00000000
+"Wait for VSync"=dword:00000000
+"Rasterizer Name"="Direct3D Hardware TnL"

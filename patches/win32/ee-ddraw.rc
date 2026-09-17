@@ -1,0 +1,32 @@
+/* D7VK's GetProxiedDDrawModule loads "<sysdir>\ddraw.dll" and reads its
+ * ProductName to check it has not loaded itself ("proxy ddraw.dll is also
+ * D7VK!"). Under Wine the loader keys modules by BASE NAME, so that request
+ * returns this proxy. Without a version resource the check cannot succeed and
+ * D7VK gives up with "Failed to load proxied ddraw.dll". Present ourselves as
+ * an ordinary DirectDraw so the validation passes and D7VK then calls our
+ * exports, which we serve from ee_sysddraw.dll (Wine's builtin ddraw).
+ */
+1 VERSIONINFO
+FILEVERSION     5,3,0,900
+PRODUCTVERSION  5,3,0,900
+FILEOS          0x4L
+FILETYPE        0x2L
+{
+  BLOCK "StringFileInfo"
+  {
+    BLOCK "080904B0"
+    {
+      VALUE "CompanyName",      "Wine"
+      VALUE "FileDescription",  "Microsoft DirectDraw"
+      VALUE "FileVersion",      "5.3.0.900"
+      VALUE "InternalName",     "DDRAW"
+      VALUE "OriginalFilename", "DDRAW.DLL"
+      VALUE "ProductName",      "Microsoft DirectDraw"
+      VALUE "ProductVersion",   "5.3.0.900"
+    }
+  }
+  BLOCK "VarFileInfo"
+  {
+    VALUE "Translation", 0x809, 1200
+  }
+}

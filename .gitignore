@@ -1,0 +1,16 @@
+.DS_Store
+/dist/
+/DerivedData/
+*.xcuserdata
+xcuserdata/
+.empire-earth-mac/
+*.swp
+*~
+*.exe
+setup_*.exe
+
+# Only README.md is published. development.md and handoff.md are the working
+# notes for this port -- they carry local paths, machine details and a long
+# experiment log, and stay on this machine deliberately.
+*.md
+!README.md
