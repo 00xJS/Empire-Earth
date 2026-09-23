@@ -160,9 +160,49 @@ PY
   log "Patched Wine win32u so Vulkan extents stay at the Metal layer size"
 }
 
+# Wine's WoW64 thunks cross between the game's 32-bit code and Wine's 64-bit
+# code with far jumps (`jmp far [ptr]` in, `ljmp` out).  Under Rosetta 2, a
+# thread crossing while another thread makes Rosetta discard translated code --
+# a DLL unloaded, a page re-protected -- can land in the wrong CPU mode.  That
+# was the "~36% of launches die in wow64cpu.dll+0x123d" crash, and it also
+# killed the first skirmish while the map loaded.  CrossOver fixes it
+# (CW HACK 20760: lcall in, lretq out); Gcenx's 11.0_1 build dropped that
+# patch, so patches/wine/patch-wow64cpu.py re-applies it to the exact DLL we
+# ship against, always starting from the untouched original.
+# EE_WOW64CPU_PATCH=0 puts the original back for comparison runs.
+install_wow64cpu_rosetta_patch() {
+  local dll bak stamp
+  dll="$RUNTIME_DIR/Wine Stable.app/Contents/Resources/wine/lib/wine/x86_64-windows/wow64cpu.dll"
+  bak="$dll.wine110"
+  stamp="$dll.ee-rosetta-stamp"
+  [[ -f "$dll" ]] || return 0
+  [[ -f "$bak" ]] || cp -p "$dll" "$bak"
+  if [[ "${EE_WOW64CPU_PATCH:-1}" == "0" ]]; then
+    if ! cmp -s "$dll" "$bak"; then
+      cp -p "$bak" "$dll"
+      rm -f "$stamp"
+      log "Restored the original wow64cpu.dll (EE_WOW64CPU_PATCH=0)"
+    fi
+    return 0
+  fi
+  if [[ -f "$stamp" && "$REPO_PATCHES/wine/patch-wow64cpu.py" -ot "$stamp" &&
+        "$REPO_PATCHES/wine/wow64cpu-rosetta.S" -ot "$stamp" ]] && ! cmp -s "$dll" "$bak"; then
+    return 0
+  fi
+  if python3 "$REPO_PATCHES/wine/patch-wow64cpu.py" "$bak" "$dll.ee-new" >"$LOG_DIR/wow64cpu-patch.log" 2>&1; then
+    mv "$dll.ee-new" "$dll"
+    date >"$stamp"
+    log "Patched Wine wow64cpu.dll for Rosetta 2 (CrossOver's lcall/lretq mode switch)"
+  else
+    rm -f "$dll.ee-new"
+    log "WARNING: wow64cpu Rosetta patch not applied (see $LOG_DIR/wow64cpu-patch.log)"
+  fi
+}
+
 install_dgvoodoo_279
 copy_repo_configs
 install_win32u_extent_patch
+install_wow64cpu_rosetta_patch
 install_moltenvk_shim
 apply_wine_reg
 if command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then

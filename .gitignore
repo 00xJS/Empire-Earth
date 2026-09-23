@@ -14,3 +14,5 @@ setup_*.exe
 # experiment log, and stay on this machine deliberately.
 *.md
 !README.md
+__pycache__/
+*.pyc

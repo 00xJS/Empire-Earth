@@ -41,6 +41,12 @@ case "${EE_GRAPHICS:-dgvoodoo}" in
     ;;
 esac
 
+if ! rosetta_ready; then
+  die "Rosetta 2 is not installed, so Wine cannot run (macOS upgrades remove it). Install it with: softwareupdate --install-rosetta --agree-to-license"
+fi
+if memory_note="$(low_memory_warning)"; then :; else log "WARNING: $memory_note"; fi
+
+configure_fullscreen
 wine_path="$(require_wine)"
 wine_env "$wine_path"
 
@@ -87,8 +93,11 @@ sleep 1
 load_config
 if [[ "${EE_FORCE_VIRTUAL_DESKTOP:-0}" == "1" ]]; then
   VIRTUAL_DESKTOP=1
-  VIRTUAL_DESKTOP_SIZE="${EE_VIRTUAL_DESKTOP_SIZE:-${VIRTUAL_DESKTOP_SIZE:-1024x801}}"
+  VIRTUAL_DESKTOP_SIZE="${EE_VIRTUAL_DESKTOP_SIZE:-${VIRTUAL_DESKTOP_SIZE:-1440x933}}"
 fi
+# One source of truth for "how big is the screen" -- the win32 shims used to
+# hard-code 800x600 and tell the game its display was smaller than it is.
+export EE_SCREEN_SIZE="${EE_SCREEN_SIZE:-${VIRTUAL_DESKTOP_SIZE:-1440x933}}"
 case "$MODE" in
   base|ee) exe="${BASE_EXE:-}" ;;
   aoc|expansion) exe="${AOC_EXE:-}" ;;
@@ -98,6 +107,10 @@ if [[ -z "$exe" || ! -f "$exe" ]]; then
 fi
 game_dir="$(cd "$(dirname "$exe")" && pwd)"
 exe_name="$(basename "$exe")"
+# watch-splash.py reads the d7vk proxy's log to tell a hang from a slow load.
+if [[ "${EE_GRAPHICS:-d7vk}" == "d7vk" ]]; then
+  export EE_DDRAW_LOG="$game_dir/ee-ddraw.log"
+fi
 
 log "Launching $label from $game_dir ($("$wine_path" --version 2>/dev/null || echo wine)) graphics=${EE_GRAPHICS:-d7vk}"
 cd "$game_dir"
@@ -144,29 +157,27 @@ watch_for_program_error() {
 }
 
 # ---------------------------------------------------------------------------
-# About 36% of launches die within ~3 s in Wine's own 32<->64 transition
-# dispatcher: the log is <=12 lines and ends either silently or with a page
-# fault at wow64cpu.dll+0x123d reading 0x00004dc9.  It is environmental -- not
-# our code, not the game -- and it is invisible to everything below it, so the
-# only honest remedy is to notice the signature and start over.  Measured
-# across 115 launch logs: 42 early deaths, ~34 of them this one signature.
-#
-# Only this signature is retried.  A genuine hang on the opening screen is a
-# real failure and still surfaces immediately.
+# Until 22 Sep 2026 about 36% of launches died within seconds in Wine's
+# 32<->64-bit thunks (page fault at wow64cpu.dll+0x123d reading 0x00004dc9, or
+# a silent exit): Rosetta landing the thunk in the wrong CPU mode.
+# install_wow64cpu_rosetta_patch fixes the cause.  Retrying stays as a cheap
+# safety net for anything similar: a launch that dies -- crashes, exits, or
+# stalls (watch-splash.py: no progress in the proxy log for 60 s, a hang seen a
+# few launches in ten on 22 Sep 2026) -- before it has rendered a single frame
+# has lost nothing, so start over.  Only a launch that is still visibly making
+# progress when the menu timeout runs out is reported without a retry.
 early_launch_death() {
   local f="$1"
   [[ -f "$f" ]] || return 1
-  if grep -qE '00004DC9 at address 7BF2123D|Unhandled page fault|Wine Program Error detected' "$f" 2>/dev/null; then
-    return 0
-  fi
-  if grep -q 'Game process exited before leaving the opening screen' "$f" 2>/dev/null &&
-     [[ "$(wc -l <"$f")" -le 12 ]]; then
-    return 0
-  fi
-  return 1
+  grep -qE 'Unhandled page fault|Wine Program Error detected|Game process (crashed|exited|stalled) before' "$f" 2>/dev/null ||
+    return 1
+  # ee-ddraw.log is rewritten by every run, so this is this attempt's record.
+  ! grep -q 'BeginScene ENTER' "$game_dir/ee-ddraw.log" 2>/dev/null
 }
 
-launch_attempts="${EE_LAUNCH_ATTEMPTS:-3}"
+# Each failed attempt now costs seconds (watch-splash.py returns as soon as the
+# game dies), so a handful of attempts is cheap.
+launch_attempts="${EE_LAUNCH_ATTEMPTS:-6}"
 attempt=1
 while :; do
 
@@ -175,6 +186,9 @@ if [[ "$attempt" -gt 1 ]]; then
   log "Launch attempt $attempt of $launch_attempts"
 fi
 
+# The proxy reopens ee-ddraw.log when the game loads it; until then the old
+# run's "BeginScene" would read as this run's first frame.
+[[ -n "${EE_DDRAW_LOG:-}" ]] && rm -f "$EE_DDRAW_LOG"
 set +e
 watch_for_program_error "$log_file" &
 watcher_pid=$!
@@ -195,16 +209,34 @@ set -e
 launch_failed=0
 if log_has_wine_crash "$log_file" || grep -q 'Wine Program Error detected' "$log_file" 2>/dev/null || wine_error_window_open; then
   launch_failed=1
-  failure_message="$label hit a Wine Program Error (crash dialog). See $log_file"
-elif [[ "$splash_status" -ne 0 ]] || grep -q 'Still on the opening screen' "$log_file" 2>/dev/null; then
+  failure_message="$label crashed while starting (Wine error). See $log_file"
+elif grep -q 'stalled before its first frame' "$log_file" 2>/dev/null; then
+  launch_failed=1
+  failure_message="$label stalled while starting. See $log_file"
+elif grep -q 'Still on the opening screen' "$log_file" 2>/dev/null; then
   launch_failed=1
   failure_message="$label did not leave the opening screen within ${splash_timeout}s. See $log_file"
+elif [[ "$splash_status" -ne 0 ]]; then
+  launch_failed=1
+  failure_message="$label exited before leaving the opening screen. See $log_file"
+else
+  # The splash probe can return a moment before the game settles; give it a
+  # few seconds before calling it gone.
+  for _ in 1 2 3 4 5; do
+    game_running && break
+    sleep 1
+  done
+  if ! game_running; then
+    echo "Game process exited before the main menu." >>"$log_file"
+    launch_failed=1
+    failure_message="$label exited before the main menu. See $log_file"
+  fi
 fi
 
 if [[ "$launch_failed" == "1" ]]; then
   stop_prefix_wine
   if early_launch_death "$log_file" && [[ "$attempt" -lt "$launch_attempts" ]]; then
-    log "Early-launch crash in Wine's 32/64 dispatcher; retrying"
+    log "Game died before its first frame; retrying"
     pkill -9 -f 'winedbg --' >/dev/null 2>&1 || true
     sleep 2
     attempt=$((attempt + 1))
@@ -215,16 +247,5 @@ fi
 
 break
 done
-
-# The game can still be starting when the splash probe returns.
-for _ in 1 2 3 4 5; do
-  if game_running; then
-    break
-  fi
-  sleep 1
-done
-if ! game_running; then
-  die "$label exited before the main menu. See $log_file"
-fi
 
 echo "$label is running. Close the game window when you are done."

@@ -73,14 +73,44 @@ static int is_tiny_size(int w, int h) {
   return w < 320 || h < 240;
 }
 
+/* ---- the screen size these shims report --------------------------------
+ * All of this used to be a hard-coded 800x600, from the era when the game's
+ * window came up degenerate and any sane constant was an improvement.  With the
+ * Wine virtual desktop working, that constant is now a lie that tells Empire
+ * Earth its screen is smaller than it is.  Report the real desktop instead --
+ * scripts/launch.sh exports it as EE_SCREEN_SIZE from VIRTUAL_DESKTOP_SIZE. */
+static void ee_screen(int *w, int *h) {
+  static int cw, ch;
+  if (!cw) {
+    char b[32];
+    int a = 0, c = 0;
+    cw = 1440;
+    ch = 933;
+    if (GetEnvironmentVariableA("EE_SCREEN_SIZE", b, sizeof b) > 0 && sscanf(b, "%dx%d", &a, &c) == 2 &&
+        a >= 320 && c >= 240) {
+      cw = a;
+      ch = c;
+    }
+    /* Deliberately no ee_log here.  ee_screen() is reached from
+     * GetSystemMetrics, which the game calls from inside
+     * DirectDrawEnumerateExA -- and logging from that path risks the loader
+     * lock this project has already been bitten by.  The size is echoed by the
+     * first EnumDisplaySettingsA line instead. */
+  }
+  *w = cw;
+  *h = ch;
+}
+
 static void fill_mode(DEVMODEA *dm) {
+  int sw, sh;
   if (!dm)
     return;
   if (!dm->dmSize)
     dm->dmSize = sizeof(DEVMODEA);
   dm->dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
-  dm->dmPelsWidth = 800;
-  dm->dmPelsHeight = 600;
+  ee_screen(&sw, &sh);
+  dm->dmPelsWidth = (DWORD)sw;
+  dm->dmPelsHeight = (DWORD)sh;
   dm->dmBitsPerPel = 32;
   dm->dmDisplayFrequency = 60;
 }
@@ -91,7 +121,8 @@ static BOOL WINAPI hook_EnumDisplaySettingsA(const char *dev, DWORD mode, DEVMOD
     return FALSE;
   if (mode == ENUM_CURRENT_SETTINGS || mode == ENUM_REGISTRY_SETTINGS || mode <= 8) {
     fill_mode(dm);
-    ee_log("EnumDisplaySettingsA %lu -> 800x600", (unsigned long)mode);
+    ee_log("EnumDisplaySettingsA %lu -> %lux%lu", (unsigned long)mode, (unsigned long)dm->dmPelsWidth,
+           (unsigned long)dm->dmPelsHeight);
     return TRUE;
   }
   return FALSE;
@@ -110,18 +141,22 @@ static LONG WINAPI hook_ChangeDisplaySettingsA(DEVMODEA *dm, DWORD flags) {
 }
 
 static int WINAPI hook_GetSystemMetrics(int idx) {
+  int sw, sh;
+  ee_screen(&sw, &sh);
   if (idx == SM_CXSCREEN || idx == SM_CXFULLSCREEN || idx == SM_CXVIRTUALSCREEN)
-    return 800;
+    return sw;
   if (idx == SM_CYSCREEN || idx == SM_CYFULLSCREEN || idx == SM_CYVIRTUALSCREEN)
-    return 600;
-  return orig_GetSystemMetrics ? orig_GetSystemMetrics(idx) : 800;
+    return sh;
+  return orig_GetSystemMetrics ? orig_GetSystemMetrics(idx) : sw;
 }
 
 static BOOL WINAPI hook_AdjustWindowRect(LPRECT rc, DWORD style, BOOL menu) {
   if (rc && is_tiny_size(rc->right - rc->left, rc->bottom - rc->top) && !(style & WS_CHILD)) {
-    ee_log("AdjustWindowRect %dx%d -> 800x600", (int)(rc->right - rc->left), (int)(rc->bottom - rc->top));
-    rc->right = rc->left + 800;
-    rc->bottom = rc->top + 600;
+    int sw, sh;
+    ee_screen(&sw, &sh);
+    ee_log("AdjustWindowRect %dx%d -> %dx%d", (int)(rc->right - rc->left), (int)(rc->bottom - rc->top), sw, sh);
+    rc->right = rc->left + sw;
+    rc->bottom = rc->top + sh;
   }
   return orig_AdjustWindowRect ? orig_AdjustWindowRect(rc, style, menu) : TRUE;
 }
@@ -141,10 +176,12 @@ static HWND WINAPI hook_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWOR
   /* Rasterizer capability probes are 16x16 TestWindowClass. Enlarging them
    * leaves a black 800x600 window on screen and the splash never hides. */
   if (!test_wnd && is_toplevel(parent, style) && is_tiny_size(w, h)) {
-    ee_log("CreateWindowExA class='%s' title='%s' %dx%d style=0x%lx -> 800x600", cbuf, tbuf, w, h,
-           (unsigned long)style);
-    w = 800;
-    h = 600;
+    int sw, sh;
+    ee_screen(&sw, &sh);
+    ee_log("CreateWindowExA class='%s' title='%s' %dx%d style=0x%lx -> %dx%d", cbuf, tbuf, w, h,
+           (unsigned long)style, sw, sh);
+    w = sw;
+    h = sh;
   } else {
     ee_log("CreateWindowExA class='%s' title='%s' %dx%d parent=%p style=0x%lx", cbuf, tbuf, w, h,
            (void *)parent, (unsigned long)style);

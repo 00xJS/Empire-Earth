@@ -12,11 +12,16 @@ Wine, Homebrew, winetricks and Rosetta 2 are free.
 
 ## Status
 
-The game **reaches its main menu and renders continuously** on an M2 Pro running
-macOS 26, at 1024×768 in a window, at roughly 175 FPS.
+**Playable.** On an M2 Pro running macOS 27 (September 2026), Empire Earth
+starts, reaches the main menu, and plays random-map games and the tutorial
+campaign **full screen** at the display's own resolution (1512×982 on a 14"
+MacBook Pro), with sound. Early in a match it runs at 105–120 FPS. A 26-minute
+random map ran without a single freeze. The menu, which the game fixes at
+1024×768, is scaled to the full screen height with black bars at the sides, and
+the cursor moves over it cleanly.
 
-Actual gameplay — starting a skirmish or a campaign — is **not yet verified**.
-See [Known issues](#known-issues).
+Starting a match can take several minutes when the Mac is short of memory —
+see [Known issues](#known-issues).
 
 ## Requirements
 
@@ -55,16 +60,19 @@ There is also a SwiftUI launcher:
 open "dist/Empire Earth.app"
 ```
 
-### If you get stuck on screen
+### Switching away, and getting out
 
-The game runs inside a Wine virtual desktop, so it should behave like a normal
-window. If it ever traps your pointer:
+The game covers the whole screen and hides the menu bar and Dock while it is in
+front. `Cmd`+`Tab` away and other apps come to the front as usual (the game pauses
+itself in the background); `Cmd`+`Tab` back to **wine** to carry on.
 
 | | |
 |---|---|
-| `Ctrl`+`Alt`+`Q` | release the mouse and let go of the window |
-| `Ctrl`+`Alt`+`X` | quit the game |
+| `Control`+`Option`+`Q` | release the mouse and minimize the game |
+| `Control`+`Option`+`X` | quit the game |
 | `./scripts/stop.sh` | panic button — stops the game, the desktop and wineserver |
+
+(`Option` is the Mac's `Alt` key. A quick tap is enough.)
 
 ## How it actually works
 
@@ -77,6 +85,42 @@ Empire Earth.exe  (32-bit PE, under Rosetta 2)
   → d3d9.dll          DXVK-Sarek, Direct3D 9 → Vulkan
   → libMoltenVK       Vulkan → Metal, via our shim        (patches/vulkan/ee-vkfix.c)
 ```
+
+### Freezes in long matches
+
+Matches used to drop to 0 FPS for 10–50 seconds at a time after a few minutes,
+with the game taking around 80,000 page faults a second. DXVK's memory for
+reading the screen back is ordinary 32-bit process memory handed to MoltenVK,
+and Wine maps all 32-bit memory readable, writable **and executable**.
+Rosetta's handling of writable, executable pages is what stalled. The MoltenVK
+shim now marks that memory read-write only as it is imported
+(`EE_VKFIX_NOEXEC=0` turns this off).
+
+### The cursor, and why the ddraw proxy flips pages itself
+
+Empire Earth draws its own cursor and expects real two-page flipping: after a
+`Flip`, the back buffer holds the page that was on screen before. The game wipes
+the old cursor off that page with the background it saved underneath it. A
+second thread moves the cursor directly on the visible page between frames. D7VK
+presents through Direct3D 9 and never swaps DirectDraw's pages, so the saved
+backgrounds picked up old cursors, which left trails across the menus.
+
+The proxy now swaps the two pages itself on every flip. It keeps its own copy of
+the visible page, because D7VK overwrites its own copy mid-frame. Match frames
+repaint the whole screen, so there it only copies the finished frame.
+
+Two related fixes:
+
+- **DXVK shader compilation.** The launcher used to set it to `async`, which
+  *skips* a draw until its shader is compiled. The first frame of every menu
+  screen therefore came out black, and the cursor saved that black: the black
+  squares. It now uses DXVK-Sarek's default, `dyasync`, which draws with a close
+  already-compiled shader instead.
+- **Blits on the CPU.** The game's small cursor blits used to run on the GPU in
+  Wine's wined3d (Apple OpenGL). That forced the whole frame to be read back out
+  of OpenGL every time the game locked the screen to draw its text, which it does
+  every frame. The proxy now does those blits on the CPU. That removed about 30%
+  of each match frame and took an early match from about 75 FPS to over 100.
 
 ### The bug that blocked this for months
 
@@ -98,36 +142,54 @@ window[flip-failed]  rect=-32000,-32000,-31840,-31969  iconic=1  fg=(OTHER)
 
 `-32000,-32000` is Windows' canonical position for a minimized window.
 
-Two things fix it, and both are on by default:
+The root cause is Wine's own "focus window" hook, which marks the DirectDraw
+device lost on every focus change. The ddraw proxy now declines that hook, vetoes
+the minimize calls (from the game and from Wine) that follow a focus change, and
+restores surfaces if a `Flip` still reports them lost. A watchdog thread also
+un-minimizes the window during startup and hands it back once the first frame
+renders.
 
-1. **A Wine virtual desktop**, so the game's window is never a macOS fullscreen
-   window and nothing minimizes it.
-2. **A watchdog thread** in the ddraw proxy that un-minimizes and re-foregrounds
-   the device window during startup, then hands the window back to you as soon as
-   the first frame renders.
+### Full screen
 
-### Why the virtual desktop is 1024×801
+The launcher reads the display size and sets the game's `Game Window
+Width`/`Height` to match, so matches render at the display's native resolution.
+Wine emulates the game's display-mode changes (its `EmulateModeset` setting), so
+when the game switches to its fixed 1024×768 menu mode, Wine scales that window
+to the full screen height, centred, instead of changing the Mac's resolution.
+Two small fixes make that work with Vulkan: the ddraw proxy reports the game
+window's own size as the Vulkan surface size, and the MoltenVK shim lets Core
+Animation do the scaling. Without them DXVK rebuilt its swapchain on every frame.
+The shim also adds a black backdrop and hides the menu bar and Dock while the
+game is in front.
 
-The game runs at 1024×768, but its window takes a constant +33px vertical offset
-when it changes mode — which clipped the bottom of the main menu, including
-**Exit Game**. The desktop is 33 rows taller to absorb that.
+`EE_EMULATE_MODESET=0` goes back to the older setup: a Wine virtual desktop the
+size of the display, where the menu sits 1:1 in the top-left corner.
+
+Two things make switching apps work: the proxy removes the "always on top" style
+that Wine's DirectDraw gives an exclusive window (Wine 11 otherwise keeps such a
+window above every app even in the background), and the shim hands the game the
+keyboard focus when you switch back, which is what ends its pause.
+
+`./scripts/set-options.sh --fullscreen off` returns to the old windowed setup;
+`--game-resolution WxH` picks a different match resolution.
 
 ## Known issues
 
-- **~36% of launches die in about 3 seconds** inside `wow64cpu.dll+0x123d`, Wine's
-  own 32↔64-bit transition dispatcher, under Rosetta. It is environmental, not
-  this project's code, and it is invisible to everything above it. `launch.sh`
-  detects the signature and retries automatically (`EE_LAUNCH_ATTEMPTS`, default 3).
-- **The depth buffer clear fails on every frame** — `Device7::Clear flags=0x2`
-  returns `0x88760816`. Harmless for the 2D menu, but it will matter in a
-  skirmish, where terrain and units need depth testing.
-- **Gameplay is unverified.** The menu renders; nobody has played a match yet.
+- **Starting a match is slow when the Mac is low on memory.** On a 16 GB Mac with
+  ~4.7 GB of swap in use, one random map took about seven minutes to load (the
+  game's own pages were being swapped out as fast as it used them); the same
+  machine later loaded the tutorial in under a minute. The launcher logs a
+  warning when swap is high and free memory is low. Quitting memory-heavy apps
+  (browsers, editors, the iOS Simulator) before playing is the fix. The game
+  pauses while it is not the front app, so a match started in the background
+  finishes loading when you switch back to it.
+- **The notch covers the middle of the in-game title bar** on MacBooks with one.
+- The launcher retries a start that dies or stalls before its first frame
+  (`EE_LAUNCH_ATTEMPTS`, default 6). The main cause of such deaths — a Rosetta
+  race in Wine's 32↔64-bit thunks (`wow64cpu.dll+0x123d`/`+0x1139`) — is fixed by
+  `patches/wine/patch-wow64cpu.py`, which the installer applies.
 - **Music is off by default.** It crashed under Wine in earlier testing. Sound
-  effects should work now that the game gets far enough to initialise Miles, but
-  this has not been confirmed.
-- Exclusive fullscreen is unreachable on this stack — MoltenVK does not implement
-  `VK_EXT_full_screen_exclusive`. A window is the honest end state. Chasing
-  `DDSCL_EXCLUSIVE` is what produced the bug above in the first place.
+  effects work.
 - Multiplayer patches such as NeoEE are optional and not bundled here.
 
 ## Graphics stacks
@@ -145,7 +207,7 @@ kept because they were useful for bisecting.
 | `d3dmetal` | Apple D3DMetal/GPTK — 64-bit only, so a 32-bit EXE cannot use it |
 
 ```bash
-./scripts/set-options.sh --graphics d7vk --virtual-desktop on --virtual-desktop-size 1024x801
+./scripts/set-options.sh --graphics d7vk --virtual-desktop on --virtual-desktop-size 1440x933
 ```
 
 Wrapper DLLs are fetched into Application Support by
@@ -157,11 +219,27 @@ committed here.
 | Variable | Effect |
 |---|---|
 | `EE_MENU_TIMEOUT` | seconds to wait for the menu (default 240) |
-| `EE_LAUNCH_ATTEMPTS` | retries for the wow64 early crash (default 3) |
+| `EE_LAUNCH_ATTEMPTS` | retries for a start that dies or stalls before its first frame (default 6) |
 | `EE_DDRAW_VERBOSE=1` | full per-call DirectDraw logging (very large) |
 | `EE_DDRAW_KEEP_FOREGROUND=0` | disable the window watchdog |
+| `EE_DDRAW_FOCUS_HOOK=1` | let Wine's focus hook run again (focus changes lose surfaces) |
+| `EE_DDRAW_ALLOW_MINIMIZE=1` | let the game and Wine minimize the window on focus loss |
+| `EE_DDRAW_KEEP_TOPMOST=1` | keep Wine's "always on top" style on the game window |
+| `EE_DDRAW_AUTO_RESTORE=0` | do not restore surfaces when a `Flip` reports them lost |
+| `EE_DDRAW_WNDTRACE=0` | stop logging the game window's focus and size messages |
+| `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
+| `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
+| `EE_DDRAW_PAGES=0` | stop the proxy's page flipping (brings back the menu cursor trails) |
+| `EE_DDRAW_SOFTBLT=0` | run the game's flip-chain blits on the GPU again (slower) |
+| `EE_WINED3D_CSMT=1` | turn wined3d's command-stream thread back on |
+| `DXVK_SHADER_COMPILATION_METHOD` | `dyasync` (default), `none` (compile on the spot) or `async` (skips draws; causes black first frames) |
+| `EE_DDRAW_PAGEDUMP=1` | debug: save the first flips of each screen as BMPs in the game folder |
+| `EE_WOW64CPU_PATCH=0` | restore Wine's original `wow64cpu.dll` |
 | `EE_VKFIX_SIZE=WxH` | override the MoltenVK shim's fallback extent |
 | `EE_VKFIX_FORCE_EXTENT=1` | force every Vulkan surface to that extent |
+| `EE_DDRAW_STRETCH=1` | grow the game window to fill the desktop (scales the picture up) |
+| `EE_VKFIX_FLOAT=1` | keep the game window above all other applications |
+| `EE_VEH=1` | install the exception handler used to identify Wine crashes |
 | `DXVK_LOG_LEVEL=info` | restore DXVK's verbose logging |
 
 ## Where to get the game files
@@ -174,4 +252,17 @@ Edition**, and download the **Windows offline backup installer**
 If you already installed the game on a Windows PC, copy the folder containing
 `Empire Earth.exe` to this Mac and point `set-game.sh` at that folder instead.
 
-Logs live in `~/Library/Application Support/EmpireEarthMac/logs`.
+## Seeing the game window
+
+The game is launched as a bare `wine` process, so macOS does not treat it as a
+registered application — some screenshot and automation tools cannot find its
+window. To capture it regardless:
+
+```bash
+SUP="$HOME/Library/Application Support/EmpireEarthMac"
+"$SUP/patches/macos/ee-splash-probe"     # prints: wine id=<N> 1024x768
+screencapture -x -l<N> /tmp/game.png
+```
+
+Logs live in `~/Library/Application Support/EmpireEarthMac/logs`, and the proxy's
+own log is `ee-ddraw.log` in the game folder.

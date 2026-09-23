@@ -100,6 +100,7 @@ typedef struct {
 #define VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT 1000255000u
 #define VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT 1000255002u
 #define VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT 2u
+#define VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT 1000275004u
 #define VK_EXTENT_DONTCARE 0xFFFFFFFFu
 
 enum {
@@ -352,6 +353,83 @@ static void install_win32u_hooks(void) {
   (void)create;
 }
 
+/* Full screen (EE_FULLSCREEN=1, set by configure_fullscreen in lib.sh): a black
+ * window over the whole display behind the game, and the menu bar and Dock
+ * hidden while the game is frontmost.  Wine never touches
+ * NSApp.presentationOptions, and the backdrop is not one of Wine's windows, so
+ * winemac.drv's own window-level bookkeeping leaves both alone.  A borderless
+ * window cannot become key, so clicking the black margin never takes keyboard
+ * focus from the game.  The options only apply while the game is the active
+ * app: Cmd-Tab away and macOS brings the menu bar and Dock straight back. */
+static NSWindow *g_backdrop;
+
+static int fullscreen_wanted(void) {
+  static int want = -1;
+  if (want < 0) {
+    const char *e = getenv("EE_FULLSCREEN");
+    want = e && e[0] == '1';
+  }
+  return want;
+}
+
+static __weak NSWindow *g_backdrop_game;
+
+static void keep_fullscreen(NSWindow *game) {
+  NSScreen *screen = game.screen ? game.screen : [NSScreen mainScreen];
+  if (!screen)
+    return;
+  g_backdrop_game = game;
+  if (!g_backdrop) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    g_backdrop = [[NSWindow alloc] initWithContentRect:screen.frame
+                                             styleMask:NSWindowStyleMaskBorderless
+                                               backing:NSBackingStoreBuffered
+                                                 defer:NO];
+    g_backdrop.backgroundColor = [NSColor blackColor];
+    g_backdrop.opaque = YES;
+    g_backdrop.hasShadow = NO;
+    g_backdrop.releasedWhenClosed = NO;
+    g_backdrop.animationBehavior = NSWindowAnimationBehaviorNone;
+    @try {
+      [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
+    } @catch (NSException *e) {
+      fprintf(stderr, "ee-vkfix: could not hide the menu bar: %s\n", e.reason.UTF8String);
+    }
+    /* Only while the game is in front: behind another app, a full-screen black
+     * window would hide every window that app is not showing on top of it. */
+    [nc addObserverForName:NSApplicationDidResignActiveNotification object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+                  (void)note;
+                  [g_backdrop orderOut:nil];
+                }];
+    [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+                  NSWindow *g = g_backdrop_game;
+                  (void)note;
+                  if (g && g.isVisible) {
+                    [g_backdrop orderWindow:NSWindowBelow relativeTo:g.windowNumber];
+                    /* Coming back to Wine must hand the game the keyboard focus:
+                     * Wine only tells the game it is active again (ending its
+                     * pause-while-inactive loop) when the game window becomes
+                     * key, and activating the app does not always do that --
+                     * on 22 Sep 2026 the game sat paused on a black screen
+                     * while Wine was the frontmost app. */
+                    if (!g.isKeyWindow && g.canBecomeKeyWindow)
+                      [g makeKeyWindow];
+                  }
+                }];
+    fprintf(stderr, "ee-vkfix: full screen -- black backdrop %gx%g, menu bar and Dock hidden\n",
+            screen.frame.size.width, screen.frame.size.height);
+    fflush(stderr);
+  }
+  if (!NSEqualRects(g_backdrop.frame, screen.frame))
+    [g_backdrop setFrame:screen.frame display:NO];
+  if (NSApp.isActive)
+    [g_backdrop orderWindow:NSWindowBelow relativeTo:game.windowNumber];
+}
+
 static void force_metal_layers(void) {
   void (^work)(void) = ^{
     @autoreleasepool {
@@ -386,13 +464,22 @@ static void force_metal_layers(void) {
             metal.contentsGravity = kCAGravityResizeAspect;
             metal.frame = CGRectMake(0, 0, host.width, host.height);
             metal.bounds = CGRectMake(0, 0, host.width, host.height);
-            metal.drawableSize = CGSizeMake(host.width, host.height);
+            /* The drawable is the swapchain image size; MoltenVK sets it when the
+             * swapchain is created.  Leave a healthy one alone.  Under Wine's
+             * emulated display modes the game renders 1024x768 into a view the
+             * size of the scaled-up screen area and winevulkan asks MoltenVK to
+             * stretch the image to it (VkSwapchainPresentScalingCreateInfoEXT);
+             * forcing the drawable to the view's size made MoltenVK copy the
+             * frame 1:1 into the view's top-left corner (22 Sep 2026).  Only a
+             * degenerate drawable -- the 16x16 plugin-probe windows -- is reset. */
+            if (metal.drawableSize.width < 320 || metal.drawableSize.height < 240)
+              metal.drawableSize = CGSizeMake(host.width, host.height);
             {
               static double last_w, last_h;
               if (host.width != last_w || host.height != last_h) {
                 fprintf(stderr, "ee-vkfix: CAMetalLayer was %gx%g host %gx%g win %gx%g; drawable %gx%g\n",
                         bounds.width, bounds.height, host.width, host.height, win_size.width,
-                        win_size.height, host.width, host.height);
+                        win_size.height, metal.drawableSize.width, metal.drawableSize.height);
                 fflush(stderr);
                 last_w = host.width;
                 last_h = host.height;
@@ -402,18 +489,42 @@ static void force_metal_layers(void) {
           if (view.subviews.count)
             [stack addObjectsFromArray:view.subviews];
         }
+        /* Asynchronously: this block runs on the main thread while the game's
+         * thread waits for it (dispatch_sync below), often from inside the
+         * game's CreateDevice.  Reordering windows, changing presentation
+         * options or activating the app can make Wine's main thread wait on
+         * that same game thread -- never do it while the game is blocked here. */
+        if (has_metal && win_size.width >= 700 && win_size.height >= 500 && fullscreen_wanted()) {
+          NSWindow *game = window;
+          dispatch_async(dispatch_get_main_queue(), ^{
+            keep_fullscreen(game);
+          });
+        }
         if (has_metal && !floated && win_size.width >= 700 && win_size.height >= 500) {
           const char *want_float = getenv("EE_VKFIX_FLOAT");
           floated = 1;
+          /* Let the game's window follow the user between Spaces instead of
+           * stranding itself on the Space it happened to be created on.  Two
+           * reasons: you cannot click a window you cannot see, and -- worse --
+           * a window on an inactive Space is occluded, which makes DXVK report
+           * device-lost and D7VK return DDERR_SURFACELOST from every Flip.
+           * That is the same failure as the minimized window, just triggered by
+           * occlusion rather than by SW_MINIMIZE. */
+          window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
           /* NSFloatingWindowLevel pins the game above every other application,
            * which is half of why the window could not be escaped.  It was added
            * when the window kept being lost; the ddraw-side watchdog covers that
            * now, so this is opt-in. */
           if (want_float && want_float[0] == '1')
             [window setLevel:NSFloatingWindowLevel];
-          [window orderFrontRegardless];
-          [NSApp activateIgnoringOtherApps:YES];
-          fprintf(stderr, "ee-vkfix: brought Metal window to front frame=%gx%g\n", win_size.width,
+          {
+            NSWindow *front = window;
+            dispatch_async(dispatch_get_main_queue(), ^{
+              [front orderFrontRegardless];
+              [NSApp activateIgnoringOtherApps:YES];
+            });
+          }
+          fprintf(stderr, "ee-vkfix: bringing Metal window to front frame=%gx%g\n", win_size.width,
                   win_size.height);
           fflush(stderr);
         }
@@ -484,10 +595,14 @@ static void fix_caps(VkSurfaceCapabilitiesKHR *caps) {
     if (caps->minImageExtent.height < g_fix_h)
       caps->minImageExtent.height = g_fix_h;
   } else {
-    if (caps->minImageExtent.width <= 1)
-      caps->minImageExtent.width = 1;
-    if (caps->minImageExtent.height <= 1)
-      caps->minImageExtent.height = 1;
+    /* Any size down to 1x1: winevulkan raises the host swapchain to at least
+     * minImageExtent, and MoltenVK reports the whole view there.  Under Wine's
+     * emulated display modes the game's swapchain (1024x768 for the menu) is
+     * smaller than its scaled-up view, and being raised to the view's size
+     * left DXVK drawing into the top-left 1024x768 of bigger images.  At the
+     * game's size the layer's contentsGravity scales it up instead. */
+    caps->minImageExtent.width = 1;
+    caps->minImageExtent.height = 1;
   }
   if (caps->maxImageExtent.width < g_fix_w)
     caps->maxImageExtent.width = 16384;
@@ -512,8 +627,17 @@ VkResult vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice gpu, VkSurfa
   force_metal_layers();
   VkResult r = real ? real(gpu, surface, caps) : -1;
   if (r == 0 && caps) {
-    fprintf(stderr, "ee-vkfix: caps %ux%u\n", caps->currentExtent.width, caps->currentExtent.height);
-    fflush(stderr);
+    static uint32_t last_w, last_h, last_mw, last_mh;
+    if (caps->currentExtent.width != last_w || caps->currentExtent.height != last_h ||
+        caps->minImageExtent.width != last_mw || caps->minImageExtent.height != last_mh) {
+      fprintf(stderr, "ee-vkfix: caps %ux%u (min %ux%u)\n", caps->currentExtent.width, caps->currentExtent.height,
+              caps->minImageExtent.width, caps->minImageExtent.height);
+      fflush(stderr);
+      last_w = caps->currentExtent.width;
+      last_h = caps->currentExtent.height;
+      last_mw = caps->minImageExtent.width;
+      last_mh = caps->minImageExtent.height;
+    }
     fix_caps(caps);
   }
   return r;
@@ -557,16 +681,117 @@ VkResult vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *i
   local.pNext = &disallowed;
   {
     VkResult r = real(device, &local, alloc, swapchain);
+    int scaled = 0;
+    for (const VkBaseOutStructure *n = info->pNext; n; n = n->pNext)
+      if (n->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT)
+        scaled = 1;
+    fprintf(stderr, "ee-vkfix: swapchain %ux%u created r=%d%s\n", local.imageExtent.width,
+            local.imageExtent.height, r, scaled ? " (present scaling requested)" : "");
+    fflush(stderr);
     force_metal_layers();
     return r;
   }
 }
 
+typedef struct VkQueue_T *VkQueue;
+typedef struct {
+  VkStructureType sType;
+  const void *pNext;
+  uint32_t waitSemaphoreCount;
+  const void *pWaitSemaphores;
+  uint32_t swapchainCount;
+  const VkSwapchainKHR *pSwapchains;
+  const uint32_t *pImageIndices;
+  VkResult *pResults;
+} VkPresentInfoKHR;
+#define VK_SUBOPTIMAL_KHR 1000001003
+
+/* MoltenVK reports VK_SUBOPTIMAL_KHR whenever a swapchain is smaller than its
+ * CAMetalLayer -- which is the whole point when the layer scales the game's
+ * 1024x768 menu up to the screen under Wine's emulated display modes.
+ * DXVK-Sarek's D3D9 swapchain recreates itself after every present that is not
+ * exactly VK_SUCCESS (SynchronizePresent), i.e. every frame.  Pass it on as
+ * success: DXVK still recreates on a real window resize from its own client-size
+ * check, and errors (OUT_OF_DATE, SURFACE_LOST) pass through untouched. */
+VkResult vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info) {
+  VkResult (*real)(VkQueue, const VkPresentInfoKHR *) = real_sym("vkQueuePresentKHR");
+  VkResult r = real ? real(queue, info) : -1;
+  if (info && info->pResults)
+    for (uint32_t i = 0; i < info->swapchainCount; i++)
+      if (info->pResults[i] == VK_SUBOPTIMAL_KHR)
+        info->pResults[i] = 0;
+  if (r == VK_SUBOPTIMAL_KHR) {
+    static int logged;
+    if (!logged++) {
+      fprintf(stderr, "ee-vkfix: present suboptimal (swapchain smaller than its layer, which scales it) -> success\n");
+      fflush(stderr);
+    }
+    r = 0;
+  }
+  return r;
+}
+
+typedef struct VkDeviceMemory_T *VkDeviceMemory;
+typedef struct {
+  VkStructureType sType;
+  const void *pNext;
+  uint64_t allocationSize;
+  uint32_t memoryTypeIndex;
+} VkMemoryAllocateInfo;
+typedef struct {
+  VkStructureType sType;
+  const void *pNext;
+  uint32_t handleType;
+  void *pHostPointer;
+} VkImportMemoryHostPointerInfoEXT;
+#define VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT 1000178000u
+
+/* A 32-bit game's memory is mapped read-write-EXECUTE by Wine (no DEP for old
+ * executables), including the host memory winevulkan allocates for every
+ * host-visible Vulkan allocation of a WoW64 process and MoltenVK imports into
+ * Metal (VK_EXT_external_memory_host).  On 22 Sep 2026 gameplay froze for 10-50 s
+ * at a time with DXVK's render thread stuck on one `rep stosd` into such a chunk
+ * (vmmap: rwx/rwx SM=SHM) for 28+ s while every other thread sat in the Rosetta
+ * runtime and the process took ~80,000 page faults a second -- Rosetta treats a
+ * writable+executable page as possible code.  Nothing ever executes from Vulkan
+ * memory, so drop the execute bit before MoltenVK sees it.  EE_VKFIX_NOEXEC=0
+ * turns this off. */
+VkResult vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *alloc,
+                          VkDeviceMemory *memory) {
+  VkResult (*real)(VkDevice, const VkMemoryAllocateInfo *, const VkAllocationCallbacks *, VkDeviceMemory *) =
+      real_sym("vkAllocateMemory");
+  static int want = -1;
+  if (want < 0) {
+    const char *e = getenv("EE_VKFIX_NOEXEC");
+    want = !(e && e[0] == '0');
+  }
+  if (want && info) {
+    for (const VkBaseOutStructure *n = info->pNext; n; n = n->pNext) {
+      if (n->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) {
+        const VkImportMemoryHostPointerInfoEXT *imp = (const VkImportMemoryHostPointerInfoEXT *)n;
+        uintptr_t page = (uintptr_t)getpagesize();
+        uintptr_t start = (uintptr_t)imp->pHostPointer & ~(page - 1);
+        uintptr_t end = ((uintptr_t)imp->pHostPointer + (uintptr_t)info->allocationSize + page - 1) & ~(page - 1);
+        int rc = imp->pHostPointer ? mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) : -1;
+        static int logged;
+        if (logged++ < 5) {
+          fprintf(stderr, "ee-vkfix: Vulkan host memory %p+%llu imported read-write, no exec (mprotect %d)\n",
+                  imp->pHostPointer, (unsigned long long)info->allocationSize, rc);
+          fflush(stderr);
+        }
+      }
+    }
+  }
+  return real ? real(device, info, alloc, memory) : -1;
+}
+
 static int is_hook(const char *name) {
   return name && (!strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") ||
                   !strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilities2KHR") ||
-                  !strcmp(name, "vkCreateSwapchainKHR") || !strcmp(name, "vkGetInstanceProcAddr") ||
-                  !strcmp(name, "vkGetDeviceProcAddr") || !strcmp(name, "vk_icdGetInstanceProcAddr"));
+                  !strcmp(name, "vkCreateSwapchainKHR") || !strcmp(name, "vkQueuePresentKHR") ||
+                  !strcmp(name, "vkAllocateMemory") ||
+                  !strcmp(name, "vkGetInstanceProcAddr") || !strcmp(name, "vkGetDeviceProcAddr") ||
+                  !strcmp(name, "vk_icdGetInstanceProcAddr"));
 }
 
 static PFN_vkVoidFunction hook_of(const char *name);
@@ -599,6 +824,10 @@ static PFN_vkVoidFunction hook_of(const char *name) {
     return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceCapabilities2KHR;
   if (!strcmp(name, "vkCreateSwapchainKHR"))
     return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
+  if (!strcmp(name, "vkQueuePresentKHR"))
+    return (PFN_vkVoidFunction)vkQueuePresentKHR;
+  if (!strcmp(name, "vkAllocateMemory"))
+    return (PFN_vkVoidFunction)vkAllocateMemory;
   if (!strcmp(name, "vkGetDeviceProcAddr"))
     return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
   if (!strcmp(name, "vkGetInstanceProcAddr"))

@@ -7,6 +7,7 @@ An 800x600 DXVK swapchain is not enough: that can present off-screen while the
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -16,14 +17,67 @@ from pathlib import Path
 MAX_TIMEOUT = 1200
 
 
+# The game's command line starts with its Windows path.  A bare substring
+# match also hits our own `wine reg add ...\AppDefaults\Empire Earth.exe\...`.
+GAME_ARGS = re.compile(r"^[A-Za-z]:\\.*\\(Empire Earth|EE-AOC)\.exe")
+# Written to the launch log by Wine when the game crashes.
+CRASH_SIGNS = ("Unhandled page fault", "Unhandled exception", "starting debugger", "Program Error")
+
+
 def game_running() -> bool:
-    out = subprocess.check_output(["ps", "-axo", "comm="], text=True, errors="replace")
-    if "Empire Earth.exe" in out or "EE-AOC.exe" in out:
-        return True
-    # Under a virtual desktop the Unix command name is explorer.exe; the game
-    # only shows up in the Windows command line.
-    args = subprocess.check_output(["ps", "-axo", "args="], text=True, errors="replace")
-    return "Empire Earth.exe" in args or "EE-AOC.exe" in args
+    """True while a live game process exists (see game_pids in lib.sh).
+
+    A Rosetta process SIGKILLed after a crash can linger in the process table,
+    stuck mid-exit with ~8 KB resident; counting it as alive is what made
+    every retry after a crash wait out the whole timeout.
+    """
+    out = subprocess.check_output(["ps", "-axo", "rss=,args="], text=True, errors="replace")
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) > 1024 and GAME_ARGS.match(parts[1]):
+            return True
+    return False
+
+
+# ee-ddraw.log (the d7vk stack's proxy log), exported by launch.sh.  Until the
+# game has drawn its first frame this log grows steadily -- plugin scan, device
+# creation, texture uploads -- so if it stops changing for STALL_SECONDS the
+# game is hung, not loading.  Seen on 22 Sep 2026 in the plugin scan and inside
+# CreateDevice, a few launches in ten; nothing has been played yet, so killing
+# it and starting over is safe.  After the first frame a quiet log means nothing:
+# the menu idles while the game is not the active app.
+DDRAW_LOG = os.environ.get("EE_DDRAW_LOG", "")
+STALL_SECONDS = int(os.environ.get("EE_STALL_SECONDS", "60"))
+
+
+def ddraw_state() -> tuple[bool, tuple[int, str]]:
+    """(first frame drawn?, a signature that changes only while the game makes progress).
+
+    The proxy's own heartbeat ("progress:" every 2 s, "window[tick]") keeps the
+    file growing even when the game is stuck, so those lines are left out; the
+    counters inside the last progress line stay identical once nothing happens.
+    """
+    if not DDRAW_LOG:
+        return True, (0, "")
+    try:
+        text = Path(DDRAW_LOG).read_text(errors="replace")
+    except OSError:
+        return False, (0, "")
+    other, progress = 0, ""
+    for line in text.splitlines():
+        if "progress:" in line:
+            progress = line.split("progress:", 1)[1]
+        elif "window[tick]" not in line:
+            other += 1
+    return "BeginScene ENTER" in text, (other, progress)
+
+
+def log_shows_crash(log_path: str) -> bool:
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError:
+        return False
+    return any(sign in text for sign in CRASH_SIGNS)
 
 
 def probe_bin() -> Path:
@@ -117,13 +171,29 @@ def main() -> int:
     started_at = time.time()
     started = False
     captured = False
+    last_sig = None
+    last_change = time.time()
     while time.time() < deadline:
+        if log_shows_crash(log_path):
+            append(log_path, "Game process crashed before leaving the opening screen.")
+            stop_wine(wineserver, prefix)
+            return 1
         if game_running():
             started = True
             if not captured and time.time() - started_at >= 6:
                 captured = True
                 capture_debug(log_path)
-            if past_splash(probe):
+            rendered, sig = ddraw_state()
+            if sig != last_sig:
+                last_sig, last_change = sig, time.time()
+            elif not rendered and time.time() - last_change >= STALL_SECONDS:
+                append(log_path, f"Game process stalled before its first frame (no progress for {STALL_SECONDS}s).")
+                stop_wine(wineserver, prefix)
+                return 1
+            # Success is the first frame actually drawn, not just the splash
+            # window going away: a window can be up while the game is still hung
+            # inside CreateDevice.
+            if rendered and past_splash(probe):
                 if not captured:
                     capture_debug(log_path)
                 append(log_path, "Past the opening screen; leaving the game running.")
@@ -136,7 +206,7 @@ def main() -> int:
             stop_wine(wineserver, prefix)
             return 1
         time.sleep(1)
-    if past_splash(probe) and game_running():
+    if past_splash(probe) and game_running() and ddraw_state()[0]:
         append(log_path, "Past the opening screen; leaving the game running.")
         return 0
     append(

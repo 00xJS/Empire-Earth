@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --virtual-desktop-size)
-      VIRTUAL_DESKTOP_SIZE="${2:-1024x801}"
+      VIRTUAL_DESKTOP_SIZE="${2:-1440x933}"
       shift 2
       ;;
     --graphics)
@@ -37,6 +37,23 @@ while [[ $# -gt 0 ]]; do
         *)
           die "Unknown graphics stack '$2' (dgvoodoo, gog-d3d9, dgvoodoo-wined3d, dxmt, d3dmetal, d7vk)"
           ;;
+      esac
+      shift 2
+      ;;
+    --fullscreen)
+      case "${2:-}" in
+        on|yes|true|1) FULLSCREEN="1" ;;
+        off|no|false|0) FULLSCREEN="0" ;;
+        *) die "Expected on/off after --fullscreen, got '${2:-}'" ;;
+      esac
+      shift 2
+      ;;
+    --game-resolution)
+      # "auto" fits the Mac's screen (below the notch); or an explicit WxH.
+      case "${2:-}" in
+        auto) GAME_RESOLUTION="auto" ;;
+        [0-9]*x[0-9]*) GAME_RESOLUTION="$2" ;;
+        *) die "Expected auto or WIDTHxHEIGHT after --game-resolution, got '${2:-}'" ;;
       esac
       shift 2
       ;;
