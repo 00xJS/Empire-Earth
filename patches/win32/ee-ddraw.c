@@ -52,6 +52,7 @@ static volatile LONG g_pages_n, g_pages_us;           /* exchanged flips and tim
  * owned, compared only) -- see soft_blt. */
 static IDirectDrawSurface7 *volatile g_chain_front, *volatile g_chain_back;
 static volatile LONG g_soft_n, g_soft_fallback;
+static volatile LONG g_nvbs, g_vb_draws, g_vb_overruns, g_vb_maxverts; /* see vb_check */
 
 static int hot_ok(unsigned *n) {
   unsigned c = (*n)++;
@@ -386,7 +387,7 @@ static DWORD WINAPI keep_foreground(void *arg) {
      * stalled.  Every 2 s for the whole session -- about 200 KB an hour -- so a
      * slowdown an hour into a match has the same timeline as one at launch. */
     if ((ticks % 40) == 20) {
-      static LONG last_s, last_l, last_f, last_pn, last_pu, last_sn;
+      static LONG last_s, last_l, last_f, last_pn, last_pu, last_sn, last_vd;
       LONG cs = g_n_surfaces, cl = g_n_locks, cf = g_n_frames;
       /* The patched wow64cpu.dll (patches/wine/patch-wow64cpu.py) counts every
        * 32<->64-bit crossing Rosetta landed in the wrong mode and had to redo,
@@ -397,12 +398,13 @@ static DWORD WINAPI keep_foreground(void *arg) {
       ReadProcessMemory(GetCurrentProcess(), (void *)0x7bf22ff0, redo, sizeof(redo), &got);
       LONG pn = g_pages_n, pu = g_pages_us;
       ee_log("progress: surfaces=%ld(+%ld) locks=%ld(+%ld) frames=%ld(+%ld) blts=%ld redo=%lu/%lu/%lu "
-             "pages=+%ld (%ld us each) softblt=+%ld fallback=%ld",
+             "pages=+%ld (%ld us each) softblt=+%ld fallback=%ld vbdraws=+%ld maxverts=%ld overruns=%ld",
              (long)cs, (long)(cs - last_s), (long)cl, (long)(cl - last_l), (long)cf, (long)(cf - last_f),
              (long)g_n_blts, got == sizeof(redo) ? redo[0] : 0UL, got == sizeof(redo) ? redo[1] : 0UL,
              got == sizeof(redo) ? redo[2] : 0UL, (long)(pn - last_pn),
              pn > last_pn ? (long)((pu - last_pu) / (pn - last_pn)) : 0L, (long)(g_soft_n - last_sn),
-             (long)g_soft_fallback);
+             (long)g_soft_fallback, (long)(g_vb_draws - last_vd), (long)g_vb_maxverts, (long)g_vb_overruns);
+      last_vd = g_vb_draws;
       last_sn = g_soft_n;
       last_pn = pn;
       last_pu = pu;
@@ -1695,6 +1697,54 @@ static HRESULT STDMETHODCALLTYPE hook_DevSetRS(IDirect3DDevice7 *this, D3DRENDER
   return hr;
 }
 
+/* ---- vertex ranges of the game's draws (diagnostics) --------------------------
+ * In dense crowds (150+ units in one spot) some units blink in and out
+ * (23 Sep 2026).  The renderer streams unit vertices through small dynamic
+ * vertex buffers -- 2442 vertices, DISCARD on wrap, NOOVERWRITE appends
+ * (DX7HRTnLDisplay.dll 0x1000a5a2), which D7VK and DXVK handle correctly.  But
+ * if a draw reaches past the end of its vertices -- a buffer's size, or the
+ * vertex count of a user-pointer draw, which is all DXVK uploads -- a Windows
+ * driver reads neighbouring memory while Vulkan/Metal's bounds checks return
+ * zeros, and exactly those units would vanish.  Count such draws. */
+#define VB_TABLE 128
+static struct {
+  void *vb;
+  DWORD verts;
+} g_vbs[VB_TABLE];
+
+static DWORD vb_size(void *vb) {
+  LONG i, n = g_nvbs;
+  if (n > VB_TABLE)
+    n = VB_TABLE;
+  for (i = n - 1; i >= 0; i--)
+    if (g_vbs[i].vb == vb)
+      return g_vbs[i].verts;
+  return 0;
+}
+
+/* size: vertices available to the draw (0 = unknown); start/num: the range
+ * the game declared; idx: its indices, relative to start. */
+static void vb_check(const char *what, DWORD size, DWORD start, DWORD num, const WORD *idx, DWORD nidx) {
+  DWORD top = start + num, i, maxi = 0;
+  InterlockedIncrement(&g_vb_draws);
+  if ((LONG)num > g_vb_maxverts)
+    g_vb_maxverts = (LONG)num;
+  if (idx && nidx) {
+    for (i = 0; i < nidx; i++)
+      if (idx[i] > maxi)
+        maxi = idx[i];
+    if (start + maxi + 1 > top)
+      top = start + maxi + 1;
+  }
+  if (size && top > size) {
+    LONG n = InterlockedIncrement(&g_vb_overruns);
+    if (n <= 20)
+      ee_log("vb: %s reaches vertex %lu but only %lu exist (start %lu, count %lu, max index %lu, %lu indices)", what,
+             (unsigned long)top, (unsigned long)size, (unsigned long)start, (unsigned long)num,
+             (unsigned long)maxi, (unsigned long)nidx);
+  }
+}
+
 /* ---- Direct3D draws, for the page exchange ----------------------------------
  * A frame with any of these is redrawn in 3D (a match) and is not exchanged at
  * its flip; the menus only BeginScene/EndScene around 2D blits.  Slots 25, 26,
@@ -1723,6 +1773,7 @@ static HRESULT STDMETHODCALLTYPE hook_DevDrawIdxPrim(IDirect3DDevice7 *this, D3D
                                                      DWORD n, WORD *idx, DWORD ni, DWORD f) {
   g_drew_3d = 1;
   InterlockedIncrement(&g_draws);
+  vb_check("DrawIndexedPrimitive", n, 0, n, idx, ni);
   return orig_DevDrawIdxPrim(this, t, fvf, v, n, idx, ni, f);
 }
 
@@ -1738,6 +1789,7 @@ static HRESULT STDMETHODCALLTYPE hook_DevDrawIdxPrimStrided(IDirect3DDevice7 *th
                                                             DWORD ni, DWORD f) {
   g_drew_3d = 1;
   InterlockedIncrement(&g_draws);
+  vb_check("DrawIndexedPrimitiveStrided", n, 0, n, idx, ni);
   return orig_DevDrawIdxPrimStrided(this, t, fvf, d, n, idx, ni, f);
 }
 
@@ -1745,6 +1797,7 @@ static HRESULT STDMETHODCALLTYPE hook_DevDrawPrimVB(IDirect3DDevice7 *this, D3DP
                                                     IDirect3DVertexBuffer7 *vb, DWORD start, DWORD n, DWORD f) {
   g_drew_3d = 1;
   InterlockedIncrement(&g_draws);
+  vb_check("DrawPrimitiveVB", vb_size(vb), start, n, NULL, 0);
   return orig_DevDrawPrimVB(this, t, vb, start, n, f);
 }
 
@@ -1753,6 +1806,7 @@ static HRESULT STDMETHODCALLTYPE hook_DevDrawIdxPrimVB(IDirect3DDevice7 *this, D
                                                        DWORD ni, DWORD f) {
   g_drew_3d = 1;
   InterlockedIncrement(&g_draws);
+  vb_check("DrawIndexedPrimitiveVB", vb_size(vb), start, n, idx, ni);
   return orig_DevDrawIdxPrimVB(this, t, vb, start, n, idx, ni, f);
 }
 
@@ -1816,6 +1870,25 @@ static void wrap_d3ddev7(void *obj) {
 }
 
 
+static HRESULT(STDMETHODCALLTYPE *orig_D3DCreateVB)(IDirect3D7 *, D3DVERTEXBUFFERDESC *, IDirect3DVertexBuffer7 **,
+                                                    DWORD);
+
+static HRESULT STDMETHODCALLTYPE hook_D3DCreateVB(IDirect3D7 *this, D3DVERTEXBUFFERDESC *desc,
+                                                  IDirect3DVertexBuffer7 **vb, DWORD flags) {
+  HRESULT hr = orig_D3DCreateVB ? orig_D3DCreateVB(this, desc, vb, flags) : DDERR_GENERIC;
+  if (SUCCEEDED(hr) && vb && *vb && desc) {
+    LONG i = InterlockedIncrement(&g_nvbs) - 1;
+    if (i < VB_TABLE) {
+      g_vbs[i].vb = *vb;
+      g_vbs[i].verts = desc->dwNumVertices;
+    }
+    if (i < 40)
+      ee_log("vb: created %p caps=0x%lx fvf=0x%lx vertices=%lu", (void *)*vb, (unsigned long)desc->dwCaps,
+             (unsigned long)desc->dwFVF, (unsigned long)desc->dwNumVertices);
+  }
+  return hr;
+}
+
 static void wrap_d3d7(void *obj) {
   void **vt;
   if (!obj)
@@ -1829,6 +1902,9 @@ static void wrap_d3d7(void *obj) {
     orig_D3DCreateDevice = (void *)vt[4];
   if (!orig_D3DEnumZBuffer)
     orig_D3DEnumZBuffer = (void *)vt[6];
+  if (!orig_D3DCreateVB)
+    orig_D3DCreateVB = (void *)vt[5];
+  vt[5] = (void *)hook_D3DCreateVB;
   vt[3] = (void *)hook_D3DEnumDevices;
   vt[4] = (void *)hook_D3DCreateDevice;
   vt[6] = (void *)hook_D3DEnumZBuffer;

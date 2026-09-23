@@ -434,14 +434,6 @@ install_d7vk() {
   # the 1512x982 desktop size) and IDirect3D7::EnumDevices reports all three D7VK
   # devices including the T&L HAL. EE_D7VK_BARE=1 drops back to raw D7VK.
   local helpers="$SUPPORT_DIR/patches/win32"
-  # Rebuild the proxy when its source is newer than the built copy, so an
-  # edited ee-ddraw.c takes effect at the next launch (the Vulkan shim does the
-  # same in launch.sh).
-  local proxy_src="$SCRIPT_DIR/../patches/win32/ee-ddraw.c"
-  if [[ "${EE_D7VK_BARE:-0}" != "1" && -f "$proxy_src" && \
-        ( ! -f "$helpers/ddraw.dll" || "$helpers/ddraw.dll" -ot "$proxy_src" ) ]]; then
-    "$SCRIPT_DIR/build-win32-helpers.sh" >/dev/null || log "WARNING: could not rebuild the ee-ddraw proxy"
-  fi
   if [[ "${EE_D7VK_BARE:-0}" != "1" && -f "$helpers/ddraw.dll" ]]; then
     cp "$d7vk/ddraw.dll"    "$dest/ddraw_eeorig.dll"
     cp "$helpers/ddraw.dll" "$dest/ddraw.dll"
@@ -666,6 +658,14 @@ reg "HKCU\\Software\\SSSI\\Empire Earth" "Game Window Width" "REG_DWORD" "${EE_G
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Game Window Height" "REG_DWORD" "${EE_GAME_HEIGHT:-900}"
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Rasterizer Name" "REG_SZ" "Direct3D Hardware TnL"
 reg "HKCU\\Software\\SSSI\\Empire Earth" "UseCandidateWindow" "REG_DWORD" "0"
+# Animation Smoothing blends every visible unit's vertices between animation
+# keyframes on the CPU, every frame, in x87 code that Rosetta runs slowly: with
+# 150+ units on screen it took half of each frame and the game fell to ~9 FPS
+# (ee-prof, 23 Sep 2026).  Off, units step between keyframes.  The game has no
+# menu option for it (registry only; it rewrites the value on exit, so set it on
+# every launch).  EE_ANIMATION_SMOOTHING=1 turns it back on.
+reg "HKCU\\Software\\SSSI\\Empire Earth" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-0}"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-0}"
 reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Music Enabled" "REG_DWORD" "0"
 reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Wait for VSync" "REG_DWORD" "0"
 reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Rasterizer Name" "REG_SZ" "Direct3D Hardware TnL"

@@ -121,6 +121,10 @@ Two related fixes:
   of OpenGL every time the game locked the screen to draw its text, which it does
   every frame. The proxy now does those blits on the CPU. That removed about 30%
   of each match frame and took an early match from about 75 FPS to over 100.
+- **Animation Smoothing off.** The game blends every unit's animation between
+  keyframes on the CPU, in old x87 code that Rosetta runs slowly; with 150+
+  units on screen that was half of every frame. The launcher turns it off (the
+  game only has it as a registry setting), so units step between poses.
 
 ### The bug that blocked this for months
 
@@ -229,6 +233,7 @@ committed here.
 | `EE_DDRAW_WNDTRACE=0` | stop logging the game window's focus and size messages |
 | `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
 | `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
+| `EE_ANIMATION_SMOOTHING=1` | turn the game's Animation Smoothing back on (off by default: with 150+ units on screen it cost half of every frame under Rosetta) |
 | `EE_DDRAW_PAGES=0` | stop the proxy's page flipping (brings back the menu cursor trails) |
 | `EE_DDRAW_SOFTBLT=0` | run the game's flip-chain blits on the GPU again (slower) |
 | `EE_WINED3D_CSMT=1` | turn wined3d's command-stream thread back on |
