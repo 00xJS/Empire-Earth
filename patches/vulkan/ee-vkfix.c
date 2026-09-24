@@ -20,6 +20,7 @@
 #include <unistd.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <objc/runtime.h>
 #include <libkern/OSCacheControl.h>
 
 typedef int32_t VkResult;
@@ -374,6 +375,104 @@ static int fullscreen_wanted(void) {
 
 static __weak NSWindow *g_backdrop_game;
 
+/* ---- Below the camera notch ------------------------------------------------
+ * On a MacBook with a notch, launch.sh plays matches in the Mac's own
+ * below-notch mode (1512x945 on a 1512x982 display).  Wine keeps a full-screen
+ * window the size of the display but centres the shorter game view in it
+ * (win32u map_monitor_rect), which leaves half the gap -- and the middle of the
+ * game's top bar -- under the notch.  Pin that view to the bottom edge instead,
+ * so the whole gap sits under the notch.  Wine re-applies its own frame every
+ * time it updates the window, so the frame setters of its view class
+ * (WineContentView) are hooked rather than moving the view once.  Only a
+ * full-screen, full-width view that holds the game's Metal layer and is short
+ * by about the notch moves.  EE_SAFE_TOP (from launch.sh) is the notch height. */
+static CGFloat notch_height(void) {
+  static CGFloat h = -1;
+  if (h < 0) {
+    const char *e = getenv("EE_SAFE_TOP");
+    h = e ? atof(e) : 0;
+    if (h < 0)
+      h = 0;
+  }
+  return h;
+}
+
+static NSPoint notch_origin(NSView *view, NSRect frame) {
+  NSView *sup = view.superview;
+  NSWindow *win = view.window;
+  NSRect screen;
+  CGFloat gap;
+  BOOL metal = NO;
+  if (notch_height() <= 0 || !fullscreen_wanted() || !sup || !win || !win.screen || !sup.isFlipped)
+    return frame.origin;
+  for (NSView *sub in view.subviews)
+    if ([sub.layer isKindOfClass:[CAMetalLayer class]]) {
+      metal = YES;
+      break;
+    }
+  screen = win.screen.frame;
+  gap = sup.bounds.size.height - frame.size.height;
+  if (!metal || fabs(win.frame.size.width - screen.size.width) > 0.5 ||
+      fabs(win.frame.size.height - screen.size.height) > 0.5 ||
+      fabs(frame.size.width - sup.bounds.size.width) > 0.5 || gap < 1 || gap > 2 * notch_height() + 16)
+    return frame.origin;
+  return NSMakePoint(frame.origin.x, gap); /* the superview is flipped: bottom edge */
+}
+
+static void (*real_view_setFrame)(id, SEL, NSRect);
+static void (*real_view_setFrameOrigin)(id, SEL, NSPoint);
+
+static void notch_setFrame(id self, SEL sel, NSRect frame) {
+  frame.origin = notch_origin(self, frame);
+  real_view_setFrame(self, sel, frame);
+}
+
+static void notch_setFrameOrigin(id self, SEL sel, NSPoint origin) {
+  NSRect frame = [(NSView *)self frame];
+  frame.origin = origin;
+  real_view_setFrameOrigin(self, sel, notch_origin(self, frame));
+}
+
+static void hook_view_method(Class c, SEL sel, IMP imp, IMP *real) {
+  Method m = class_getInstanceMethod(c, sel);
+  if (!m)
+    return;
+  *real = method_getImplementation(m);
+  /* When Wine's class inherits the method from NSView, add an override to that
+   * class alone -- no other view in the process is touched. */
+  if (!class_addMethod(c, sel, imp, method_getTypeEncoding(m)))
+    *real = method_setImplementation(m, imp);
+}
+
+static void pin_below_notch(NSView *metal_view) { /* main thread */
+  static int hooked;
+  Class wine_view = NSClassFromString(@"WineContentView");
+  NSView *client = metal_view.superview;
+  NSPoint want;
+  if (notch_height() <= 0 || !fullscreen_wanted() || !wine_view)
+    return;
+  if (!hooked) {
+    hooked = 1;
+    hook_view_method(wine_view, @selector(setFrame:), (IMP)notch_setFrame, (IMP *)&real_view_setFrame);
+    hook_view_method(wine_view, @selector(setFrameOrigin:), (IMP)notch_setFrameOrigin,
+                     (IMP *)&real_view_setFrameOrigin);
+    fprintf(stderr, "ee-vkfix: below-notch game views pinned to the bottom edge (notch %g)\n", notch_height());
+    fflush(stderr);
+  }
+  if (!client || !real_view_setFrameOrigin || ![client isKindOfClass:wine_view])
+    return;
+  want = notch_origin(client, client.frame);
+  if (!NSEqualPoints(want, client.frame.origin)) {
+    fprintf(stderr, "ee-vkfix: game view %gx%g moved from y=%g to y=%g (below the notch)\n", client.frame.size.width,
+            client.frame.size.height, client.frame.origin.y, want.y);
+    fflush(stderr);
+    [client setFrameOrigin:client.frame.origin];
+    /* The strip the view leaves shows the window's own background -- dark
+     * grey in dark mode, a visible line just under the notch. */
+    client.window.backgroundColor = [NSColor blackColor];
+  }
+}
+
 static void keep_fullscreen(NSWindow *game) {
   NSScreen *screen = game.screen ? game.screen : [NSScreen mainScreen];
   if (!screen)
@@ -448,6 +547,7 @@ static void force_metal_layers(void) {
           if ([view.layer isKindOfClass:[CAMetalLayer class]]) {
             has_metal = YES;
             view.hidden = NO;
+            pin_below_notch(view);
             CAMetalLayer *metal = (CAMetalLayer *)view.layer;
             NSSize bounds = metal.bounds.size;
             NSSize host = view.bounds.size;

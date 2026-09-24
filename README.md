@@ -158,6 +158,11 @@ renders.
 
 The launcher reads the display size and sets the game's `Game Window
 Width`/`Height` to match, so matches render at the display's native resolution.
+On a MacBook with a camera notch they use the Mac's own below-notch mode instead
+(1512×945 on a 14" MacBook Pro): Wine would centre that picture, leaving the
+middle of the game's top bar under the notch, so the MoltenVK shim pins it to
+the bottom edge and the notch covers only black. `--game-resolution 1512x982`
+brings back the full height.
 Wine emulates the game's display-mode changes (its `EmulateModeset` setting), so
 when the game switches to its fixed 1024×768 menu mode, Wine scales that window
 to the full screen height, centred, instead of changing the Mac's resolution.
@@ -210,7 +215,6 @@ the same value. It plays in matches; the menus have none.
   (browsers, editors, the iOS Simulator) before playing is the fix. The game
   pauses while it is not the front app, so a match started in the background
   finishes loading when you switch back to it.
-- **The notch covers the middle of the in-game title bar** on MacBooks with one.
 - The launcher retries a start that dies or stalls before its first frame
   (`EE_LAUNCH_ATTEMPTS`, default 6). The main cause of such deaths — a Rosetta
   race in Wine's 32↔64-bit thunks (`wow64cpu.dll+0x123d`/`+0x1139`) — is fixed by

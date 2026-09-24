@@ -134,7 +134,7 @@ PY
 # Exports the variables apply-launch-patches.sh and ee-vkfix read.
 configure_fullscreen() {
   local want="${EE_FULLSCREEN:-${FULLSCREEN:-1}}" res="${EE_GAME_RESOLUTION:-${GAME_RESOLUTION:-auto}}"
-  local info src bin w h top gw gh
+  local info src bin w h top below gw gh
   case "$want" in 1|true|on|yes) ;; *) export EE_FULLSCREEN=0; return 0 ;; esac
   src="$SCRIPT_DIR/../patches/macos/ee-screen-info.m"
   bin="$SUPPORT_DIR/patches/macos/ee-screen-info"
@@ -147,9 +147,15 @@ configure_fullscreen() {
     export EE_FULLSCREEN=0
     return 0
   fi
-  read -r w h top <<<"$info"
+  read -r w h top below <<<"$info"
   if [[ "$res" =~ ^([0-9]+)x([0-9]+)$ ]]; then
     gw="${BASH_REMATCH[1]}" gh="${BASH_REMATCH[2]}"
+  elif [[ "${below:-0}" -gt 0 ]]; then
+    # A camera notch: play in the Mac's own below-notch mode (1512x945 on a 14"
+    # MacBook Pro).  The MoltenVK shim pins that shorter picture to the bottom
+    # of the screen, so the notch covers only black instead of the middle of
+    # the game's top bar.  --game-resolution WxH (e.g. the full 1512x982) wins.
+    gw="$w" gh="$below"
   else
     gw="$w" gh="$h"
   fi
