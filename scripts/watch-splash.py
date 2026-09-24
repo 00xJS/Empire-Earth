@@ -48,10 +48,15 @@ def game_running() -> bool:
 # the menu idles while the game is not the active app.
 DDRAW_LOG = os.environ.get("EE_DDRAW_LOG", "")
 STALL_SECONDS = int(os.environ.get("EE_STALL_SECONDS", "60"))
+# A start counts once the game has begun this many frames.  One is not enough:
+# Art of Conquest at its 16-bit defaults drew a single frame and hung on a black
+# screen, and was reported as running (23 Sep 2026).  The proxy logs the first
+# 12 BeginScene calls, so the count is reliable up to there.
+FRAMES_TO_START = 10
 
 
 def ddraw_state() -> tuple[bool, tuple[int, str]]:
-    """(first frame drawn?, a signature that changes only while the game makes progress).
+    """(first frames drawn?, a signature that changes only while the game makes progress).
 
     The proxy's own heartbeat ("progress:" every 2 s, "window[tick]") keeps the
     file growing even when the game is stuck, so those lines are left out; the
@@ -69,7 +74,7 @@ def ddraw_state() -> tuple[bool, tuple[int, str]]:
             progress = line.split("progress:", 1)[1]
         elif "window[tick]" not in line:
             other += 1
-    return "BeginScene ENTER" in text, (other, progress)
+    return text.count("BeginScene ENTER") >= FRAMES_TO_START, (other, progress)
 
 
 def log_shows_crash(log_path: str) -> bool:
@@ -187,7 +192,7 @@ def main() -> int:
             if sig != last_sig:
                 last_sig, last_change = sig, time.time()
             elif not rendered and time.time() - last_change >= STALL_SECONDS:
-                append(log_path, f"Game process stalled before its first frame (no progress for {STALL_SECONDS}s).")
+                append(log_path, f"Game process stalled before its first frames (no progress for {STALL_SECONDS}s).")
                 stop_wine(wineserver, prefix)
                 return 1
             # Success is the first frame actually drawn, not just the splash

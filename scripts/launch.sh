@@ -168,7 +168,9 @@ early_launch_death() {
   grep -qE 'Unhandled page fault|Wine Program Error detected|Game process (crashed|exited|stalled) before' "$f" 2>/dev/null ||
     return 1
   # ee-ddraw.log is rewritten by every run, so this is this attempt's record.
-  ! grep -q 'BeginScene ENTER' "$game_dir/ee-ddraw.log" 2>/dev/null
+  # Ten frames, as in watch-splash.py: a game hung after its first one has
+  # lost nothing either.
+  [[ "$(grep -c 'BeginScene ENTER' "$game_dir/ee-ddraw.log" 2>/dev/null)" -lt 10 ]]
 }
 
 # Each failed attempt now costs seconds (watch-splash.py returns as soon as the
