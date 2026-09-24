@@ -505,10 +505,14 @@ static void bypass_wined3d_focus_hook(void);
  * Log the focus, activation and size messages the game window receives, and how
  * long the game's window procedure spends on each, so a handler that parks the
  * thread (an old game's "pause while inactive" loop) shows up with a duration.
- * EE_DDRAW_WNDTRACE=0 turns it off. */
+ * EE_DDRAW_WNDTRACE=0 turns the logging off.  The same subclass defers
+ * WM_ACTIVATEAPP (see trace_wndproc); EE_DDRAW_SYNC_ACTIVATEAPP=1 stops that. */
 static WNDPROC g_game_wndproc;
 static HWND g_traced_hwnd;
 static BOOL g_traced_unicode;
+static int g_wndtrace_log = 1, g_activateapp_sync;
+static BOOL g_deactivate_pending; /* a deferred WM_ACTIVATEAPP(FALSE) is in the queue */
+#define EE_WM_ACTIVATEAPP_LATER (WM_APP + 0x3e1)
 
 static const char *traced_msg(UINT m) {
   switch (m) {
@@ -522,6 +526,8 @@ static const char *traced_msg(UINT m) {
   case WM_DISPLAYCHANGE: return "WM_DISPLAYCHANGE";
   case WM_SYSCOMMAND: return "WM_SYSCOMMAND";
   case WM_CLOSE: return "WM_CLOSE";
+  case WM_QUERYENDSESSION: return "WM_QUERYENDSESSION";
+  case WM_ENDSESSION: return "WM_ENDSESSION";
   case WM_CANCELMODE: return "WM_CANCELMODE";
   case WM_WINDOWPOSCHANGED: return "WM_WINDOWPOSCHANGED";
   default: return NULL;
@@ -530,14 +536,52 @@ static const char *traced_msg(UINT m) {
 
 static LRESULT CALLBACK trace_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
   static unsigned n_posc, n_other;
-  const char *name = traced_msg(m);
+  const char *name;
   DWORD t0, dt;
   LRESULT r;
   int loud;
+  /* The game's WM_ACTIVATEAPP(FALSE) handler (Empire Earth.exe 0x662656) posts
+   * to its cursor thread and spins until that thread answers, and the cursor
+   * thread first waits for the game's UI lock.  The game polls DirectInput
+   * while holding that lock (0x661889), and Wine's DirectInput pumps sent
+   * messages inside GetDeviceState -- so a macOS app switch landing there ran
+   * the handler nested inside the lock: deadlocked, frozen, and it could not be
+   * quit (23 Sep 2026).  Re-post the deactivation instead, so the game handles
+   * it from its own message loop, where it never holds the lock (that pump
+   * dispatches only sent messages, never posted ones).  Activation stays
+   * synchronous -- its handler waits for nothing, and the game's "paused while
+   * inactive" loops wait on it -- and it cancels a deactivation still in the
+   * queue, so switching away and straight back never leaves the game paused. */
+  if (m == WM_ACTIVATEAPP && !g_activateapp_sync) {
+    if (!w && (g_traced_unicode ? PostMessageW(h, EE_WM_ACTIVATEAPP_LATER, w, l)
+                                : PostMessageA(h, EE_WM_ACTIVATEAPP_LATER, w, l))) {
+      g_deactivate_pending = TRUE;
+      if (g_wndtrace_log)
+        ee_log("wndproc WM_ACTIVATEAPP w=0x0 l=0x%lx -- deferred to the message loop", (unsigned long)l);
+      return 0;
+    }
+    if (w && g_deactivate_pending) {
+      g_deactivate_pending = FALSE;
+      if (g_wndtrace_log)
+        ee_log("wndproc WM_ACTIVATEAPP: active again before the deferred deactivation ran; dropping it");
+    }
+  }
+  if (m == EE_WM_ACTIVATEAPP_LATER) {
+    if (!g_deactivate_pending)
+      return 0;
+    g_deactivate_pending = FALSE;
+    m = WM_ACTIVATEAPP;
+  }
+  name = g_wndtrace_log ? traced_msg(m) : NULL;
   if (!name)
     return g_traced_unicode ? CallWindowProcW(g_game_wndproc, h, m, w, l)
                             : CallWindowProcA(g_game_wndproc, h, m, w, l);
-  loud = hot_ok(m == WM_WINDOWPOSCHANGED ? &n_posc : &n_other) || m == WM_ACTIVATEAPP || m == WM_ACTIVATE;
+  /* Quitting from the Mac side (Dock > Quit, Cmd+Q) arrives as WM_QUERYENDSESSION
+   * and WM_ENDSESSION, after which winemac.drv TerminateProcess()es the game --
+   * no DLL detach, no other trace.  Unlogged, that exit looked exactly like a
+   * crash (23 Sep 2026), so these and WM_CLOSE are always logged. */
+  loud = hot_ok(m == WM_WINDOWPOSCHANGED ? &n_posc : &n_other) || m == WM_ACTIVATEAPP || m == WM_ACTIVATE ||
+         m == WM_CLOSE || m == WM_QUERYENDSESSION || m == WM_ENDSESSION;
   if (loud) {
     if (m == WM_WINDOWPOSCHANGED && l) {
       const WINDOWPOS *wp = (const WINDOWPOS *)l;
@@ -559,7 +603,9 @@ static void trace_game_wndproc(HWND hwnd) {
   LONG_PTR cur;
   if (want < 0) {
     char b[8];
-    want = !(GetEnvironmentVariableA("EE_DDRAW_WNDTRACE", b, sizeof b) > 0 && b[0] == '0');
+    g_wndtrace_log = !(GetEnvironmentVariableA("EE_DDRAW_WNDTRACE", b, sizeof b) > 0 && b[0] == '0');
+    g_activateapp_sync = GetEnvironmentVariableA("EE_DDRAW_SYNC_ACTIVATEAPP", b, sizeof b) > 0 && b[0] == '1';
+    want = g_wndtrace_log || !g_activateapp_sync;
   }
   if (!want || !hwnd || (g_traced_hwnd && IsWindow(g_traced_hwnd)))
     return;
