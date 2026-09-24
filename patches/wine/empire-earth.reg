@@ -21,13 +21,14 @@ REGEDIT4
 "VideoMemorySize"="2048"
 "renderer"="gl"
 "OffscreenRenderingMode"="backbuffer"
-"csmt"="0"
+"csmt"=dword:00000000
 
 [HKEY_CURRENT_USER\Software\Wine\Mac Driver]
 "RetinaMode"="n"
 
+; "Music Enabled" is not set here: the game's Options > Music Quality and the
+; launcher's music checkbox own it (this file is imported on every Play).
 [HKEY_CURRENT_USER\Software\SSSI\Empire Earth]
-"Music Enabled"=dword:00000000
 "Game Bit Depth"=dword:00000020
 "Texture Bit Depth"=dword:00000020
 "Wait for VSync"=dword:00000000
@@ -37,6 +38,5 @@ REGEDIT4
 "UseCandidateWindow"=dword:00000000
 
 [HKEY_CURRENT_USER\Software\Mad Doc Software\EE-AOC]
-"Music Enabled"=dword:00000000
 "Wait for VSync"=dword:00000000
 "Rasterizer Name"="Direct3D Hardware TnL"

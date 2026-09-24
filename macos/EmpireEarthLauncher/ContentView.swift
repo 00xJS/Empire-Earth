@@ -77,13 +77,14 @@ struct ContentView: View {
     private var optionsCard: some View {
         GroupBox("Options") {
             VStack(alignment: .leading, spacing: 8) {
-                Toggle("In-game music (can crash after a few minutes)", isOn: musicBinding)
-                Toggle("Virtual desktop (WineHQ: Gold often will not start with this on)", isOn: desktopBinding)
+                Toggle("In-game music (same as the game's Options > Music Quality)", isOn: musicBinding)
+                Toggle("Virtual desktop (only used when full screen is off)", isOn: desktopBinding)
                 Picker("Graphics", selection: graphicsBinding) {
-                    Text("dgVoodoo 2.79 + DXVK (recommended)").tag("dgvoodoo")
-                    Text("GOG D3D7→D3D9 + DXVK").tag("gog-d3d9")
-                    Text("dgVoodoo + Wine wined3d").tag("dgvoodoo-wined3d")
-                    Text("dgVoodoo + DXMT (Wine Devel)").tag("dxmt")
+                    Text("D7VK + DXVK (default)").tag("d7vk")
+                    Text("dgVoodoo 2.79 + DXVK (does not reach the menu)").tag("dgvoodoo")
+                    Text("GOG D3D7→D3D9 + DXVK (does not reach the menu)").tag("gog-d3d9")
+                    Text("dgVoodoo + Wine wined3d (does not reach the menu)").tag("dgvoodoo-wined3d")
+                    Text("dgVoodoo + DXMT (does not reach the menu)").tag("dxmt")
                     Text("D3DMetal / GPTK (needs 32-bit DLLs)").tag("d3dmetal")
                 }
             }

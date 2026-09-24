@@ -29,9 +29,36 @@ wine_path="$(require_wine)"
 wine_env "$wine_path"
 "$SCRIPT_DIR/install-compat-patches.sh" >/dev/null
 
-reg() {
-  "$wine_path" reg add "$1" /v "$2" /t "$3" /d "$4" /f >/dev/null 2>&1 || true
+# Registry writes are collected into one .reg file and imported once, when this
+# script exits: every `wine reg add` is a whole Wine process under Rosetta, and
+# the 70-odd of them took about 13 s of every launch.  Order is kept, so a later
+# write (or delete) of the same value still wins.
+REG_BATCH="$(mktemp -t ee-launch-reg)"
+printf 'REGEDIT4\n' >"$REG_BATCH"
+reg_key() {
+  local k="$1"
+  k="${k/#HKCU\\/HKEY_CURRENT_USER\\}"
+  printf '%s' "${k/#HKLM\\/HKEY_LOCAL_MACHINE\\}"
 }
+reg() {
+  local data
+  case "$3" in
+    REG_DWORD) data="$(printf 'dword:%08x' "$4")" ;;
+    *) data="\"${4//\\/\\\\}\"" ;;
+  esac
+  printf '\n[%s]\n"%s"=%s\n' "$(reg_key "$1")" "$2" "$data" >>"$REG_BATCH"
+}
+reg_delete() {
+  printf '\n[%s]\n"%s"=-\n' "$(reg_key "$1")" "$2" >>"$REG_BATCH"
+}
+flush_reg() {
+  if "$wine_path" regedit /S "$REG_BATCH" >/dev/null 2>&1; then
+    rm -f "$REG_BATCH"
+  else
+    log "WARNING: registry import failed; kept $REG_BATCH"
+  fi
+}
+trap flush_reg EXIT
 
 skip_movies() {
   [[ "${EE_SKIP_MOVIES:-1}" == "1" ]] || return 0
@@ -520,7 +547,6 @@ if [[ "${EE_FORCE_VIRTUAL_DESKTOP:-0}" == "1" ]]; then
   VIRTUAL_DESKTOP=1
   VIRTUAL_DESKTOP_SIZE="${EE_VIRTUAL_DESKTOP_SIZE:-${VIRTUAL_DESKTOP_SIZE:-1440x933}}"
 fi
-MUSIC_ENABLED=0
 
 reg "HKCU\\Software\\Wine\\DllOverrides" "ddraw" "REG_SZ" "native"
 reg "HKCU\\Software\\Wine\\DllOverrides" "dsound" "REG_SZ" "builtin"
@@ -577,7 +603,7 @@ reg "HKCU\\Software\\Wine\\WineDbg" "ShowCrashDialog" "REG_DWORD" "0"
 
 # winecfg -v can open a GUI and hang under the Mac driver. Set XP via registry.
 reg "HKCU\\Software\\Wine" "Version" "REG_SZ" "winxp"
-"$wine_path" reg add "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe" /v Version /t REG_SZ /d winxp /f >/dev/null 2>&1 || true
+reg "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe" "Version" "REG_SZ" "winxp"
 reg "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\DllOverrides" "version" "REG_SZ" "native"
 
 reg "HKCU\\Software\\Wine\\Direct3D" "VideoMemorySize" "REG_SZ" "2048"
@@ -627,9 +653,9 @@ if [[ "${EE_EMULATE_MODESET:-0}" == "1" ]]; then
   reg "HKCU\\Software\\Wine\\X11 Driver" "EmulateModeset" "REG_SZ" "y"
   log "Display modes emulated by Wine (no virtual desktop)"
 else
-  "$wine_path" reg delete "HKCU\\Software\\Wine\\X11 Driver" /v EmulateModeset /f >/dev/null 2>&1 || true
+  reg_delete "HKCU\\Software\\Wine\\X11 Driver" "EmulateModeset"
 fi
-"$wine_path" reg delete "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\X11 Driver" /v EmulateModeset /f >/dev/null 2>&1 || true
+reg_delete "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\X11 Driver" "EmulateModeset"
 if [[ "${VIRTUAL_DESKTOP:-0}" == "1" ]]; then
   # Per-application virtual desktop: every Wine window composites into one Mac
   # NSWindow and GetSystemMetrics reports the desktop size, not the Mac display.
@@ -644,13 +670,17 @@ if [[ "${VIRTUAL_DESKTOP:-0}" == "1" ]]; then
   reg "HKCU\\Software\\Wine\\Explorer" "Desktop" "REG_SZ" "EmpireEarth"
   log "Virtual desktop EmpireEarth ${VIRTUAL_DESKTOP_SIZE:-1440x933} enabled for Empire Earth.exe"
 else
-  "$wine_path" reg delete "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\Explorer" /v Desktop /f >/dev/null 2>&1 || true
+  reg_delete "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\Explorer" "Desktop"
   # The block above also sets the prefix-wide Explorer\Desktop; leaving it
   # behind kept every later run in the virtual desktop regardless.
-  "$wine_path" reg delete "HKCU\\Software\\Wine\\Explorer" /v Desktop /f >/dev/null 2>&1 || true
+  reg_delete "HKCU\\Software\\Wine\\Explorer" "Desktop"
 fi
 
-reg "HKCU\\Software\\SSSI\\Empire Earth" "Music Enabled" "REG_DWORD" "0"
+# "Music Enabled" is left alone: it belongs to the game (Options > Music
+# Quality, saved on exit) and to the launcher's music checkbox, which writes it
+# through set-options.sh.  It used to be forced to 0 here on every launch,
+# because music was thought to crash under Wine; with native DirectMusic that
+# was never reproduced.
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Game Bit Depth" "REG_DWORD" "32"
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Texture Bit Depth" "REG_DWORD" "32"
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Wait for VSync" "REG_DWORD" "0"
@@ -666,9 +696,16 @@ reg "HKCU\\Software\\SSSI\\Empire Earth" "UseCandidateWindow" "REG_DWORD" "0"
 # every launch).  EE_ANIMATION_SMOOTHING=1 turns it back on.
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-0}"
 reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-0}"
-reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Music Enabled" "REG_DWORD" "0"
+# Art of Conquest keeps its own copy of every display setting.  Left at its
+# defaults (16-bit colour and textures, 800x600) it drew one frame and then hung
+# in Wine's OpenGL ddraw path on a black screen (23 Sep 2026).
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Game Bit Depth" "REG_DWORD" "32"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Texture Bit Depth" "REG_DWORD" "32"
 reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Wait for VSync" "REG_DWORD" "0"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Game Window Width" "REG_DWORD" "${EE_GAME_WIDTH:-1440}"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Game Window Height" "REG_DWORD" "${EE_GAME_HEIGHT:-900}"
 reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Rasterizer Name" "REG_SZ" "Direct3D Hardware TnL"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "UseCandidateWindow" "REG_DWORD" "0"
 
 if [[ -n "${GAME_DIR:-}" ]]; then
   skip_movies "$GAME_DIR"

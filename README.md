@@ -15,10 +15,11 @@ Wine, Homebrew, winetricks and Rosetta 2 are free.
 **Playable.** On an M2 Pro running macOS 27 (September 2026), Empire Earth
 starts, reaches the main menu, and plays random-map games and the tutorial
 campaign **full screen** at the display's own resolution (1512×982 on a 14"
-MacBook Pro), with sound. Early in a match it runs at 105–120 FPS. A 26-minute
-random map ran without a single freeze. The menu, which the game fixes at
-1024×768, is scaled to the full screen height with black bars at the sides, and
-the cursor moves over it cleanly.
+MacBook Pro), with sound effects and music. Early in a match it runs at 105–120
+FPS. A 26-minute random map ran without a single freeze. The Art of Conquest
+expansion reaches its menu and plays random maps the same way. The menu, which
+the game fixes at 1024×768, is scaled to the full screen height with black bars
+at the sides, and the cursor moves over it cleanly.
 
 Starting a match can take several minutes when the Mac is short of memory —
 see [Known issues](#known-issues).
@@ -177,6 +178,28 @@ keyboard focus when you switch back, which is what ends its pause.
 `./scripts/set-options.sh --fullscreen off` returns to the old windowed setup;
 `--game-resolution WxH` picks a different match resolution.
 
+### Switching apps without freezing the game
+
+Switching away could freeze a match for good: no picture, and no way to quit
+it except `stop.sh`. When the game loses focus, its window thread waits for its
+cursor-drawing thread, and that thread first takes the game's UI lock. The game
+reads DirectInput while holding that lock, and Wine's DirectInput handles
+pending window messages inside those reads, so a switch that landed there ran
+the "focus lost" handler inside the lock: each thread waited on the other. The
+proxy now delivers the game's `WM_ACTIVATEAPP` for losing focus from its own
+message loop instead, where the lock is never held; regaining focus is
+delivered as before.
+
+### Music
+
+The soundtrack is adaptive DirectMusic (`Data/Music/*.sgt`, `.sty`, `.dls`),
+played by the native DirectMusic that `setup-prefix.sh` installs. It used to be
+forced off on every launch, by `apply-launch-patches.sh` and by
+`patches/wine/empire-earth.reg`, on an old report that it crashed under Wine;
+nothing here ever showed that. Music now belongs to the game's own Options →
+Music Quality (Off, Low, High) and the launcher's music checkbox, which sets
+the same value. It plays in matches; the menus have none.
+
 ## Known issues
 
 - **Starting a match is slow when the Mac is low on memory.** On a 16 GB Mac with
@@ -192,8 +215,6 @@ keyboard focus when you switch back, which is what ends its pause.
   (`EE_LAUNCH_ATTEMPTS`, default 6). The main cause of such deaths — a Rosetta
   race in Wine's 32↔64-bit thunks (`wow64cpu.dll+0x123d`/`+0x1139`) — is fixed by
   `patches/wine/patch-wow64cpu.py`, which the installer applies.
-- **Music is off by default.** It crashed under Wine in earlier testing. Sound
-  effects work.
 - Multiplayer patches such as NeoEE are optional and not bundled here.
 
 ## Graphics stacks
@@ -231,6 +252,7 @@ committed here.
 | `EE_DDRAW_KEEP_TOPMOST=1` | keep Wine's "always on top" style on the game window |
 | `EE_DDRAW_AUTO_RESTORE=0` | do not restore surfaces when a `Flip` reports them lost |
 | `EE_DDRAW_WNDTRACE=0` | stop logging the game window's focus and size messages |
+| `EE_DDRAW_SYNC_ACTIVATEAPP=1` | deliver "focus lost" to the game at once again (can freeze it when you switch apps) |
 | `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
 | `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
 | `EE_ANIMATION_SMOOTHING=1` | turn the game's Animation Smoothing back on (off by default: with 150+ units on screen it cost half of every frame under Rosetta) |

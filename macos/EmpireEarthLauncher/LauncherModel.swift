@@ -35,7 +35,7 @@ struct EngineStatus: Codable, Equatable {
         musicEnabled: false,
         virtualDesktop: false,
         virtualDesktopSize: "1920x1080",
-        graphicsStack: "dgvoodoo",
+        graphicsStack: "d7vk",
         canPlay: false,
         canPlayAoc: false,
         errors: [],

@@ -21,15 +21,34 @@ fi
 python3 - "$wine_path" "$winetricks_path" "$PREFIX" "$prefix_ok" "$dm" \
   "${GAME_DIR:-}" "${BASE_EXE:-}" "${AOC_EXE:-}" \
   "${MUSIC_ENABLED:-0}" "${VIRTUAL_DESKTOP:-0}" "${VIRTUAL_DESKTOP_SIZE:-1920x1080}" \
-  "${EE_GRAPHICS:-dgvoodoo}" <<'PY'
-import json, os, sys
+  "${EE_GRAPHICS:-dgvoodoo}" "$CONFIG_FILE" <<'PY'
+import json, os, re, sys
 
 def flag(value):
     return str(value) in {"1", "true", "True"}
 
+def game_music(prefix, config_path):
+    """The game's own "Music Enabled" (Options > Music Quality, saved when the
+    game exits), when the registry was saved after the launcher's config --
+    otherwise the checkbox was just changed and the registry is not flushed yet."""
+    reg = os.path.join(prefix, "user.reg")
+    try:
+        if os.path.getmtime(reg) <= os.path.getmtime(config_path):
+            return None
+        text = open(reg, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    section = re.search(r"^\[Software\\\\SSSI\\\\Empire Earth\][^\n]*\n(.*?)(?:\n\n|\Z)", text, re.S | re.M)
+    value = section and re.search(r'^"Music Enabled"=dword:([0-9a-fA-F]+)', section.group(1), re.M)
+    return int(value.group(1), 16) == 1 if value else None
+
 wine, winetricks, prefix, prefix_ok, dm = sys.argv[1:6]
 game_dir, base_exe, aoc_exe = sys.argv[6:9]
 music, vd, vd_size = sys.argv[9:12]
+config_path = sys.argv[13] if len(sys.argv) > 13 else ""
+music_on = game_music(prefix, config_path)
+if music_on is None:
+    music_on = flag(music)
 graphics = sys.argv[12] if len(sys.argv) > 12 else "dgvoodoo"
 errors = []
 warnings = []
@@ -59,7 +78,7 @@ payload = {
     "game_dir": game_dir or None,
     "base_exe": base_exe if base_exe and os.path.isfile(base_exe) else None,
     "aoc_exe": aoc_exe or None,
-    "music_enabled": flag(music),
+    "music_enabled": music_on,
     "virtual_desktop": flag(vd),
     "virtual_desktop_size": vd_size or "1920x1080",
     "graphics_stack": graphics or "dgvoodoo",

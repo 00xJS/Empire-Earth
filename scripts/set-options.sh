@@ -87,6 +87,7 @@ if [[ "$MUSIC_ENABLED" == "1" ]]; then
   music_dword=1
 fi
 
+# The same value the game's Options > Music Quality (Off vs Low/High) saves.
 "$wine_path" reg add "HKCU\\Software\\SSSI\\Empire Earth" /v "Music Enabled" /t REG_DWORD /d "$music_dword" /f >/dev/null 2>&1 || true
-# Art of Conquest uses a sibling key in some installs.
-"$wine_path" reg add "HKCU\\Software\\SSSI\\Empire Earth Gold" /v "Music Enabled" /t REG_DWORD /d "$music_dword" /f >/dev/null 2>&1 || true
+# Art of Conquest keeps its settings under Mad Doc Software.
+"$wine_path" reg add "HKCU\\Software\\Mad Doc Software\\EE-AOC" /v "Music Enabled" /t REG_DWORD /d "$music_dword" /f >/dev/null 2>&1 || true

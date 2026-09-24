@@ -39,7 +39,9 @@ load_config() {
   GAME_DIR=""
   BASE_EXE=""
   AOC_EXE=""
-  MUSIC_ENABLED="0"
+  # Music is on unless the launcher's checkbox (or the game's Options > Music
+  # Quality) turns it off: it plays through native DirectMusic (23 Sep 2026).
+  MUSIC_ENABLED="1"
   # Defaults are the configuration that reaches the main menu (16 Sep 2026).
   # The virtual desktop is load-bearing, not cosmetic: without it Wine's macOS
   # driver minimizes the exclusive-fullscreen window, DXVK reports device-lost,
@@ -82,6 +84,7 @@ PY
 )"
   EE_GRAPHICS="${EE_GRAPHICS:-${GRAPHICS_STACK:-d7vk}}"
   # Keys missing from an older config.json load as empty strings.
+  MUSIC_ENABLED="${MUSIC_ENABLED:-1}"
   FULLSCREEN="${FULLSCREEN:-1}"
   GAME_RESOLUTION="${GAME_RESOLUTION:-auto}"
 }
@@ -262,9 +265,8 @@ wine_env() {
   wine_dir="$(dirname "$wine_path")"
   export WINEPREFIX="$PREFIX"
   export WINEDEBUG="${WINEDEBUG:--all,+err}"
-  # dgVoodoo ddraw (D3D7→D3D11) + DXVK-macOS d3d11. dxgi must be native and sit
-  # next to d3d11.dll; builtin DXGI is skipped when the game-dir d3d11 import fails.
-  export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree,mshtml=,dsound=builtin,ddraw=native,d3dimm=native,d3d11=native,d3d10core=native,dxgi=native,d3d9=builtin}"
+  # DLL overrides live in the registry (apply-launch-patches.sh); see launch.sh.
+  export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree,mshtml=}"
   export MVK_CONFIG_LOG_LEVEL="${MVK_CONFIG_LOG_LEVEL:-0}"
   export MVK_CONFIG_RESUME_LOST_DEVICE="${MVK_CONFIG_RESUME_LOST_DEVICE:-1}"
   # DXVK's own logging was 100,534 identical warn lines per run

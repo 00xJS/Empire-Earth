@@ -12,32 +12,21 @@ unset WINE || true
 unset WINELOADER || true
 load_config
 
+# The DLL overrides live in the registry (apply-launch-patches.sh writes them per
+# graphics stack).  This variable used to repeat them joined with commas, but
+# Wine splits WINEDLLOVERRIDES on ';', so each string parsed as a single entry
+# for mscoree/mshtml and every other override in it was ignored.  All it ever
+# did -- and all it needs to do -- is keep Wine's .NET and HTML engines off.
+export WINEDLLOVERRIDES="mscoree,mshtml="
 case "${EE_GRAPHICS:-dgvoodoo}" in
-  gog-d3d9)
-    export WINEDLLOVERRIDES="mscoree,mshtml=,dsound=builtin,ddraw=native,d3d9=native,dxgi=native,d3d11=builtin,d3d10core=builtin"
-    ;;
-  dgvoodoo-wined3d)
-    export WINEDLLOVERRIDES="mscoree,mshtml=,dsound=builtin,ddraw=native,d3dimm=native,d3d11=builtin,d3d10core=builtin,dxgi=builtin,d3d9=builtin"
-    ;;
   dxmt)
-    export WINEDLLOVERRIDES="mscoree,mshtml=,dsound=builtin,ddraw=native,d3dimm=native,d3d11=native,d3d10core=native,dxgi=native,winemetal=native,d3d9=builtin"
     export EMPIRE_EARTH_WINE="${EMPIRE_EARTH_WINE:-$HOME/Library/Application Support/EmpireEarthMac/runtime/Wine Devel.app/Contents/Resources/wine/bin/wine}"
     ;;
   d7vk)
-    # ddraw=native,builtin is load-bearing: D7VK proxies DirectDrawEnumerate* to
-    # Wine's builtin ddraw in syswow64. With a bare ddraw=native it logs
-    # "Failed to load proxied ddraw.dll" and the rasterizer scan dies early.
-    export WINEDLLOVERRIDES="mscoree,mshtml=,dsound=builtin,ddraw=native,builtin,d3d9=native,d3dimm=builtin,d3d11=builtin,d3d10core=builtin,dxgi=builtin,wined3d=builtin"
     # D7VK can really change modes, so drop the dgVoodoo-era lies in ee-ddraw.
     # (Both were tested and are neutral here, but the truth is the right default
     # on a stack that can honour it.)
     export EE_DDRAW_REAL_SETMODE=1 EE_DDRAW_REAL_GETMODE=1
-    ;;
-  d3dmetal)
-    export WINEDLLOVERRIDES="mscoree,mshtml=,dsound=builtin,ddraw=native,d3dimm=native,d3d11=native,d3d10core=native,dxgi=native,d3d9=builtin"
-    ;;
-  *)
-    export WINEDLLOVERRIDES="mscoree,mshtml=,dsound=builtin,ddraw=native,d3dimm=native,d3d11=native,d3d10core=native,dxgi=native,d3d9=builtin"
     ;;
 esac
 
@@ -85,7 +74,14 @@ log_file="$LOG_DIR/launch-$(date '+%Y%m%d-%H%M%S').log"
 stop_prefix_wine
 sleep 1
 
-"$SCRIPT_DIR/set-options.sh" --apply-registry >/dev/null
+# The launcher's music checkbox writes "Music Enabled" when it changes
+# (set-options.sh); otherwise the game owns it (Options > Music Quality, saved on
+# exit), so it is not re-applied on every Play -- that undid the game's own
+# choice.  Apply it once for installs from before 23 Sep 2026, whose launches
+# forced music off whatever the checkbox said.
+if [[ ! -f "$SUPPORT_DIR/.music-left-to-game" ]]; then
+  "$SCRIPT_DIR/set-options.sh" --apply-registry >/dev/null && touch "$SUPPORT_DIR/.music-left-to-game"
+fi
 "$SCRIPT_DIR/apply-launch-patches.sh" >/dev/null
 # Mac Driver (RetinaMode) is read when wineserver starts. Restart so it applies.
 stop_prefix_wine
