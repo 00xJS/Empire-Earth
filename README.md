@@ -21,8 +21,8 @@ expansion reaches its menu and plays random maps the same way. The menu, which
 the game fixes at 1024×768, is scaled to the full screen height with black bars
 at the sides, and the cursor moves over it cleanly.
 
-Starting a match can take several minutes when the Mac is short of memory —
-see [Known issues](#known-issues).
+A Gigantic random map loads in about 16 seconds, and the load carries on while
+you are in another app.
 
 ## Requirements
 
@@ -195,6 +195,16 @@ proxy now delivers the game's `WM_ACTIVATEAPP` for losing focus from its own
 message loop instead, where the lock is never held; regaining focus is
 delivered as before.
 
+### Slow match loads (fixed)
+
+On 22 Sep 2026 one random map took about seven minutes to load, which was put
+down to a Mac short of memory (4.7 GB of swap in use). It was two bugs since
+fixed: the Vulkan page-fault storm above, and the focus-loss deadlock. Retested
+on a 16 GB Mac on 23 Sep 2026, a Gigantic random map loaded in 16 s with nothing
+else running, 16 s with 8 GB of other memory held (6.6 GB of swap in use), and
+16 s with that 8 GB constantly in use — only the frame rate dropped then,
+from about 150 to 107 FPS. With the game in the background it kept loading.
+
 ### Music
 
 The soundtrack is adaptive DirectMusic (`Data/Music/*.sgt`, `.sty`, `.dls`),
@@ -207,18 +217,12 @@ the same value. It plays in matches; the menus have none.
 
 ## Known issues
 
-- **Starting a match is slow when the Mac is low on memory.** On a 16 GB Mac with
-  ~4.7 GB of swap in use, one random map took about seven minutes to load (the
-  game's own pages were being swapped out as fast as it used them); the same
-  machine later loaded the tutorial in under a minute. The launcher logs a
-  warning when swap is high and free memory is low. Quitting memory-heavy apps
-  (browsers, editors, the iOS Simulator) before playing is the fix. The game
-  pauses while it is not the front app, so a match started in the background
-  finishes loading when you switch back to it.
 - The launcher retries a start that dies or stalls before its first frame
   (`EE_LAUNCH_ATTEMPTS`, default 6). The main cause of such deaths — a Rosetta
   race in Wine's 32↔64-bit thunks (`wow64cpu.dll+0x123d`/`+0x1139`) — is fixed by
-  `patches/wine/patch-wow64cpu.py`, which the installer applies.
+  `patches/wine/patch-wow64cpu.py`, which the installer applies. About one start
+  in ten still stalls on the opening banner (the game's own thread stuck in
+  Wine's `DestroyWindow` on a 16×16 test window); the retry covers it.
 - Multiplayer patches such as NeoEE are optional and not bundled here.
 
 ## Graphics stacks
