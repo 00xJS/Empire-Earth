@@ -30,6 +30,12 @@ static HMODULE WINAPI hook_LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags)
 static void ee_log(const char *fmt, ...) {
   va_list ap;
   if (!g_log) {
+    /* Appended across launches, so a crash's record survives the next start;
+     * past 4 MB it moves to ee-version.old.log instead of growing for ever. */
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExA("ee-version.log", GetFileExInfoStandard, &fa) &&
+        (fa.nFileSizeHigh || fa.nFileSizeLow > 4u * 1024 * 1024))
+      MoveFileExA("ee-version.log", "ee-version.old.log", MOVEFILE_REPLACE_EXISTING);
     g_log = fopen("ee-version.log", "a");
     if (g_log)
       setvbuf(g_log, NULL, _IONBF, 0);
