@@ -85,10 +85,39 @@ SSEM_FN static int SSEM_THIS SSEM(below)(const float *pl, const float *pt) {
  * float, fistp (round to nearest) and look the table up. */
 SSEM_FN static float SSEM(umcos)(float a) {
   T x = a;
+  unsigned n = 0;
+  /* Headings that a long match never wraps reach UMCos as angles in the
+   * thousands, and the loops below step 2 pi per iteration.  In double every
+   * step is exact while |a| < 2^30 (a float beyond 64 and the float 2 pi are
+   * both multiples of 2^-21), so the loops end at a +- k 2 pi for the first k
+   * that lands in range, and most of the way can be jumped in one exact step
+   * (k 2 pi has at most 28 + 24 bits).  The jump stops at least one step short
+   * -- the rounded quotient is off by far less than one -- and the loops take
+   * the last steps with the original's own comparisons.  In float the steps
+   * round (24-bit x87 did too), so the float variant always walks. */
+  if (sizeof(T) == 8 && (x < -64 || x > 64) && x > -0x1p30 && x < 0x1p30) {
+    const T st = g_ssem.cos_step;
+    int k;
+    if (x < 0) {
+      k = (int)(((T)g_ssem.cos_lo - x) / st) - 1;
+      x = x + (T)k * st;
+    } else {
+      k = (int)((x - (T)g_ssem.cos_hi) / st) - 1;
+      x = x - (T)k * st;
+    }
+    n += (unsigned)k;
+  }
   while (!(x >= (T)g_ssem.cos_lo))
-    x = x + (T)g_ssem.cos_step;
+    x = x + (T)g_ssem.cos_step, n++;
   while (x > (T)g_ssem.cos_hi)
-    x = x - (T)g_ssem.cos_step;
+    x = x - (T)g_ssem.cos_step, n++;
+  if (g_ssem_st.on) {
+    g_ssem_st.calls++;
+    g_ssem_st.steps += n;
+    g_ssem_st.big += n > 64;
+    if ((a < 0 ? -a : a) > g_ssem_st.max)
+      g_ssem_st.max = a < 0 ? -a : a;
+  }
   if (!(x >= 0))
     x = -x;
   {
@@ -135,4 +164,95 @@ SSEM_FN static void SSEM_THIS SSEM(ypr)(float *m, float a, float b, float c) {
   m[6] = (float)((T)t1 * cc + (T)nsc * sa);
   m[8] = (float)((T)sc * cb);
   m[10] = (float)((T)cc * cb);
+}
+
+/* ?Intersects@GE3DLine@@QBE_NABVGE3DPlane@@AAM@Z  (rva 0x25b07): the line
+ * (origin +0, direction +0xc) against the plane (point, normal): false when
+ * d.n is 0 or NaN (je after fcoms 0.0), else t = (w.n) / (d.n) with w the
+ * plane point minus the origin. */
+SSEM_FN static int SSEM_THIS SSEM(line_plane)(const float *L, const float *pl, float *t) {
+  const T wx = (T)pl[0] - L[0], wy = (T)pl[1] - L[1], wz = (T)pl[2] - L[2];
+  const T den = ((T)L[5] * pl[5] + (T)L[4] * pl[4]) + (T)L[3] * pl[3];
+  if (den == 0 || den != den)
+    return 0;
+  *t = (float)(((wz * pl[5] + wy * pl[4]) + wx * pl[3]) / den);
+  return 1;
+}
+
+/* ?ComputeDirection@GE3DLine@@AAEXABVGE3DPoint@@@Z  (rva 0x1fb6): direction
+ * = q - origin, one component at a time (re-reads after each store). */
+SSEM_FN static void SSEM_THIS SSEM(line_dir)(float *L, const float *q) {
+  L[3] = (float)((T)q[0] - L[0]);
+  L[4] = (float)((T)q[1] - L[1]);
+  L[5] = (float)((T)q[2] - L[2]);
+}
+
+/* DX7HRTnLDisplay.dll ?DrawTerrainMaterial@DX7Rasterizer@@... vertex loop
+ * (rva 0x688d-0x6ac0): for every terrain polygon in the NULL-terminated list,
+ * three 36-byte vertices: position (copied), a zero normal, a diffuse colour
+ * packed from four fistp'd values (alpha*255, then r, g, b times brightness
+ * times 255, each rounded to float first as the original's fstps does), and
+ * the polygon's texture coordinates.  About 30 x87 instructions a vertex in
+ * the original -- 11% of the render thread in a big match. */
+SSEM_FN static void SSEM(tfill)(const char *const *polys, char *out) {
+  const T K = g_ssem.terrain_k;
+  for (; *polys; polys++) {
+    const char *P = *polys;
+    const float *alpha = (const float *)(P + 0xc);
+    int k;
+    for (k = 0; k < 3; k++) {
+      const float *v = *(const float *const *)(P + 4 * k);
+      float *o = (float *)out;
+      unsigned c;
+      int a, r, g, b;
+      memcpy(o, v, 12);
+      o[3] = o[4] = o[5] = 0;
+      a = ssem_fistp((float)((T)alpha[k] * K));
+      r = ssem_fistp((float)(((T)v[3] * v[6]) * K));
+      g = ssem_fistp((float)(((T)v[4] * v[6]) * K));
+      b = ssem_fistp((float)(((T)v[5] * v[6]) * K));
+      c = (unsigned)a;
+      c = (c << 8) | (unsigned)r;
+      c = (c << 8) | (unsigned)g;
+      c = (c << 8) | (unsigned)b;
+      memcpy(o + 6, &c, 4);
+      memcpy(o + 7, P + 0x18 + 8 * k, 8);
+      out += 36;
+    }
+  }
+}
+
+/* DX7Rasterizer::CopyAndSmoothStdVertices / CopyAndSmoothStdColorVertices
+ * (DX7HRTnLDisplay.dll rva 0x3d1e / 0x3c4f, "Animation Smoothing"): blend the
+ * model's two keyframes into the vertex buffer.  t = model[0x130]; keyframe
+ * vertex arrays at +4 of model[0x104][model[0x134]] (A) and [model[0x138]] (B);
+ * the material's vertices start at mat[0x34], mat[0x38] of them.  Position and
+ * normal: each of the six = s*A + t*B with s = 1 - t, each product rounded,
+ * then the sum, then stored as a float (the order of the two products does not
+ * matter: rounded sums commute).  Std input is 32 bytes (x,y,z,nx,ny,nz,u,v):
+ * colour white, u,v from A.  Colour input is 36 bytes (...,colour,u,v): colour
+ * and u,v from A.  Output 36 bytes either way. */
+SSEM_FN static void SSEM(smooth)(const char *model, const char *mat, char *out, int color) {
+  const float t = *(const float *)(model + 0x130);
+  const T s = (T)1 - t;
+  const char *const *frames = *(const char *const *const *)(model + 0x104);
+  const unsigned stride = color ? 36 : 32;
+  const unsigned first = *(const unsigned *)(mat + 0x34), count = *(const unsigned *)(mat + 0x38);
+  const char *a = *(const char *const *)(frames[*(const int *)(model + 0x134)] + 4) + first * stride;
+  const char *b = *(const char *const *)(frames[*(const int *)(model + 0x138)] + 4) + first * stride;
+  const char *const end = a + count * stride;
+  for (; a < end; a += stride, b += stride, out += 36) {
+    const float *fa = (const float *)a, *fb = (const float *)b;
+    float *o = (float *)out;
+    int k;
+    for (k = 0; k < 6; k++)
+      o[k] = (float)(s * fa[k] + (T)t * fb[k]);
+    if (color)
+      memcpy(o + 6, fa + 6, 12);
+    else {
+      static const unsigned white = 0xffffffffu;
+      memcpy(o + 6, &white, 4);
+      memcpy(o + 7, fa + 6, 8);
+    }
+  }
 }

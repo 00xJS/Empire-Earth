@@ -1363,8 +1363,20 @@ static HRESULT STDMETHODCALLTYPE hook_SurfFlip(IDirectDrawSurface7 *this, IDirec
   IDirectDrawSurface7 *back = NULL;
   LARGE_INTEGER t0, t1, t2, t3, freq;
   int paged = 0, drew_3d = InterlockedExchange(&g_drew_3d, 0), locked = InterlockedExchange(&g_locked_back, 0);
-  int match_frame = drew_3d && locked;
   LONG draws = InterlockedExchange(&g_draws, 0), dcs = InterlockedExchange(&g_dcs, 0);
+  /* A match frame redraws the whole back buffer, so only the front page needs
+   * the frame (one copy after the flip) instead of a full exchange (three).
+   * GetDC for the HUD text brings the finished frame into the back buffer just
+   * as a Lock does -- and in big matches (25 Sep 2026) the game only uses
+   * GetDC, so every frame took the 740 us exchange.  EE_DDRAW_MATCH_GETDC=0
+   * goes back to counting only locked frames. */
+  static int getdc_counts = -1;
+  int match_frame;
+  if (getdc_counts < 0) {
+    char b[8];
+    getdc_counts = !(GetEnvironmentVariableA("EE_DDRAW_MATCH_GETDC", b, sizeof b) > 0 && b[0] == '0');
+  }
+  match_frame = drew_3d && (locked || (getdc_counts && dcs > 0));
   if (!target && InterlockedIncrement(&g_flips_since_chain) <= 30)
     ee_log("pages: flip %ld of this chain: %ld draw calls, %ld GetDC, back buffer %slocked", (long)g_flips_since_chain,
            (long)draws, (long)dcs, locked ? "" : "not ");
@@ -1379,7 +1391,20 @@ static HRESULT STDMETHODCALLTYPE hook_SurfFlip(IDirectDrawSurface7 *this, IDirec
     EnterCriticalSection(&g_pages_cs);
     back = pages_prepare(this);
     if (back && match_frame) {
-      paged = 2; /* after the flip: primary <- back only */
+      /* front page <- back, BEFORE the flip: right now the back buffer's
+       * DirectDraw copy is current (GetDC or Lock just downloaded the frame),
+       * while after the flip D7VK downloads it from the GPU all over again --
+       * 700 us a frame (25 Sep 2026).  Same content: the frame about to show. */
+      paged = 2;
+      if (FAILED(pages_copy(g_pages_front, back))) {
+        paged = 0; /* fall back to the full exchange */
+        if (SUCCEEDED(pages_copy(g_pages_spare, back))) {
+          paged = 1;
+        } else {
+          back = NULL;
+          LeaveCriticalSection(&g_pages_cs);
+        }
+      }
     } else if (back && SUCCEEDED(pages_copy(g_pages_spare, back))) {
       paged = 1;
       if (pagedump_on() && g_flips_since_chain <= 6)
@@ -1440,8 +1465,7 @@ static HRESULT STDMETHODCALLTYPE hook_SurfFlip(IDirectDrawSurface7 *this, IDirec
         if (SUCCEEDED(h1))
           h2 = pages_copy(g_pages_front, g_pages_spare);
       } else {
-        h1 = S_OK;
-        h2 = pages_copy(g_pages_front, back);
+        h1 = h2 = S_OK; /* front page already updated before the flip */
       }
       QueryPerformanceCounter(&t3);
       QueryPerformanceFrequency(&freq);

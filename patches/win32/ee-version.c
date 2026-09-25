@@ -9,7 +9,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <mmsystem.h>
 #include "ee-ssemath.h"
+#include "ee-calltime.h"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -496,6 +498,23 @@ static void patch_rasterizer(HMODULE mod) {
   patch_iat(mod, "user32.dll", "AdjustWindowRect", (void *)hook_AdjustWindowRect);
   patch_iat(mod, "msvcrt.dll", "abort", (void *)hook_abort);
   patch_iat(mod, "msvcrt.dll", "raise", (void *)hook_raise);
+  /* DX7HRTnLDisplay's terrain vertex loop to SSE2 (ee-ssemath.h).  The game
+   * LoadLibrary's its renderers more than once; ee_ssemath_terrain recognises
+   * its own patch, so only a real change is logged. */
+  {
+    char b[8];
+    if (GetProcAddress(mod, SSEM_TNL_DTM) && !(GetEnvironmentVariableA("EE_SSE_MATH", b, sizeof b) > 0 && b[0] == '0')) {
+      static HMODULE smooth_logged[2]; /* both renderers carry the same loops */
+      int n;
+      if (ee_ssemath_terrain(mod, ee_log) == 1)
+        ee_log("sse maths: DrawTerrainMaterial's vertex loop redirected to SSE2 (module %p)", (void *)mod);
+      n = ee_ssemath_smooth(mod, ee_log);
+      if (n && mod != smooth_logged[0] && mod != smooth_logged[1]) {
+        smooth_logged[smooth_logged[0] ? 1 : 0] = mod;
+        ee_log("sse maths: Animation Smoothing's keyframe blend: %d of 2 loops on SSE2 (module %p)", n, (void *)mod);
+      }
+    }
+  }
 }
 
 /* Low-Level Engine.dll holds the Verify()/assertion helper that formats
@@ -954,10 +973,11 @@ static void ee_render_sleep(void) {
  * long readers waited for it. */
 typedef void(__attribute__((thiscall)) * lockfn)(void *);
 static lockfn tr_wlock, tr_wunlock, tr_rlock;
-static volatile LONG ls_writes, ls_hold_us, ls_hold_max, ls_rwait_us, ls_reads;
+static volatile LONG ls_writes, ls_hold_us, ls_hold_max, ls_rwait_us, ls_reads, ls_wwait_us;
 static LARGE_INTEGER ls_freq, ls_t_acq;
 static DWORD ls_next;
 
+static void ls_log_timers(void), ls_log_readers(void), ls_log_umcos(void);
 static LONG ls_us(LARGE_INTEGER a, LARGE_INTEGER b) { return (LONG)((b.QuadPart - a.QuadPart) * 1000000 / ls_freq.QuadPart); }
 
 /* Writes per thread since the last stats line: the busiest writer is the
@@ -985,9 +1005,45 @@ static DWORD ls_top_writer(void) {
   return t;
 }
 
+/* Gaps between one thread's successive writes, bucketed: the simulation is
+ * paced by a 33 ms timer, so its gaps show whether it keeps 30 updates/s. */
+static LONG ls_gap[6]; /* <30, 30-36, 36-42, 42-50, 50-70, >=70 ms */
+static DWORD ls_gap_tid;
+static LARGE_INTEGER ls_gap_t;
+
+/* Where the writes come from (the game's WriteLock call sites) and how long
+ * each site holds the world: the simulation tick is the busy one. */
+static struct { void *ra; LONG n, us; } ls_site[8];
+static int ls_cur_site = -1;
 static void __attribute__((thiscall)) ls_wlock(void *self) {
+  LARGE_INTEGER w0;
+  void *ra = __builtin_return_address(0);
+  int i;
+  QueryPerformanceCounter(&w0);
   tr_wlock(self);
   ls_count_writer(); /* under the lock: one writer at a time */
+  ls_cur_site = -1;
+  for (i = 0; i < 8; i++)
+    if (ls_site[i].ra == ra || !ls_site[i].ra) {
+      ls_site[i].ra = ra;
+      ls_site[i].n++;
+      ls_cur_site = i;
+      break;
+    }
+  if (GetCurrentThreadId() == ls_gap_tid && ls_gap_t.QuadPart) {
+    LARGE_INTEGER now;
+    LONG ms;
+    QueryPerformanceCounter(&now);
+    ms = ls_us(ls_gap_t, now) / 1000;
+    ls_gap[ms < 30 ? 0 : ms < 36 ? 1 : ms < 42 ? 2 : ms < 50 ? 3 : ms < 70 ? 4 : 5]++;
+  }
+  if (GetCurrentThreadId() == ls_gap_tid)
+    QueryPerformanceCounter(&ls_gap_t);
+  {
+    LARGE_INTEGER w1;
+    QueryPerformanceCounter(&w1);
+    InterlockedExchangeAdd(&ls_wwait_us, ls_us(w0, w1));
+  }
   QueryPerformanceCounter(&ls_t_acq); /* one writer at a time: the lock guarantees it */
   InterlockedIncrement(&ls_writes);
 }
@@ -998,26 +1054,92 @@ static void __attribute__((thiscall)) ls_wunlock(void *self) {
   QueryPerformanceCounter(&t);
   held = ls_us(ls_t_acq, t);
   InterlockedExchangeAdd(&ls_hold_us, held);
+  if (ls_cur_site >= 0)
+    ls_site[ls_cur_site].us += held;
   if (held > ls_hold_max)
     ls_hold_max = held;
   tr_wunlock(self);
   if ((LONG)(now - ls_next) >= 0) {
     LONG w = InterlockedExchange(&ls_writes, 0), h = InterlockedExchange(&ls_hold_us, 0), m = InterlockedExchange(&ls_hold_max, 0);
-    LONG r = InterlockedExchange(&ls_reads, 0), rw = InterlockedExchange(&ls_rwait_us, 0);
+    LONG r = InterlockedExchange(&ls_reads, 0), rw = InterlockedExchange(&ls_rwait_us, 0), ww = InterlockedExchange(&ls_wwait_us, 0);
+    DWORD top = ls_top_writer();
     if (ls_next)
-      ee_log("world lock: %.1f writes/s held %.2f ms each (max %.1f); %.1f reads/s waited %.2f ms each; writer %04lx",
-             w / 10.0, w ? h / 1000.0 / w : 0.0, m / 1000.0, r / 10.0, r ? rw / 1000.0 / r : 0.0,
-             (unsigned long)ls_top_writer());
+      ee_log("world lock: %.1f writes/s waited %.2f ms, held %.2f ms each (max %.1f); %.1f reads/s waited %.2f ms each; writer %04lx; "
+             "gaps <30:%ld 30-36:%ld 36-42:%ld 42-50:%ld 50-70:%ld 70+:%ld",
+             w / 10.0, w ? ww / 1000.0 / w : 0.0, w ? h / 1000.0 / w : 0.0, m / 1000.0, r / 10.0, r ? rw / 1000.0 / r : 0.0,
+             (unsigned long)top,
+             ls_gap[0], ls_gap[1], ls_gap[2], ls_gap[3], ls_gap[4], ls_gap[5]);
+    if (ls_next) {
+      int i;
+      for (i = 0; i < 8 && ls_site[i].ra; i++)
+        if (ls_site[i].n)
+          ee_log("  writes from %p: %.1f/s held %.2f ms each", ls_site[i].ra, ls_site[i].n / 10.0,
+                 ls_site[i].us / 1000.0 / ls_site[i].n);
+      for (i = 0; i < 8; i++)
+        ls_site[i].n = ls_site[i].us = 0;
+      ls_log_timers();
+      ls_log_readers();
+      ls_log_umcos();
+      ct_report(ee_log, 10.0);
+    }
+    ct_set_thread(top);
+    memset(ls_gap, 0, sizeof ls_gap);
+    ls_gap_tid = top;
+    ls_gap_t.QuadPart = 0;
     ls_next = now + 10000;
   }
 }
+/* Reads and read waits per thread: which threads the simulation holds up,
+ * and from where each thread reads (its busiest ReadLock call site). */
+static struct { volatile LONG tid, n, us; void *volatile ra; volatile LONG ra_n; } ls_rd[8];
 static void __attribute__((thiscall)) ls_rlock(void *self) {
   LARGE_INTEGER a, b;
+  LONG us, t = (LONG)GetCurrentThreadId();
+  int i;
   QueryPerformanceCounter(&a);
   tr_rlock(self);
   QueryPerformanceCounter(&b);
-  InterlockedExchangeAdd(&ls_rwait_us, ls_us(a, b));
+  us = ls_us(a, b);
+  InterlockedExchangeAdd(&ls_rwait_us, us);
   InterlockedIncrement(&ls_reads);
+  for (i = 0; i < 8; i++)
+    if (ls_rd[i].tid == t || InterlockedCompareExchange(&ls_rd[i].tid, t, 0) == 0) {
+      void *ra = __builtin_return_address(0);
+      InterlockedIncrement(&ls_rd[i].n);
+      InterlockedExchangeAdd(&ls_rd[i].us, us);
+      if (ls_rd[i].ra == ra)
+        ls_rd[i].ra_n++;
+      else if (--ls_rd[i].ra_n <= 0) { /* majority vote: keeps the most frequent site */
+        ls_rd[i].ra = ra;
+        ls_rd[i].ra_n = 1;
+      }
+      break;
+    }
+}
+static void ls_log_readers(void) {
+  char line[400];
+  int i, len = 0;
+  for (i = 0; i < 8 && ls_rd[i].tid; i++) {
+    LONG n = InterlockedExchange(&ls_rd[i].n, 0), us = InterlockedExchange(&ls_rd[i].us, 0);
+    if (n && len < (int)sizeof line - 60)
+      len += snprintf(line + len, sizeof line - len, " %04lx %.1f/s waited %.1f ms/s (%.2f each) from %p;", (unsigned long)ls_rd[i].tid,
+                      n / 10.0, us / 10000.0, us / 1000.0 / n, ls_rd[i].ra);
+  }
+  if (len)
+    ee_log("  readers:%s", line);
+}
+static void ls_log_umcos(void) {
+  unsigned c = g_ssem_st.calls, s = g_ssem_st.steps, big = g_ssem_st.big;
+  int i;
+  g_ssem_st.calls = g_ssem_st.steps = g_ssem_st.big = 0;
+  if (c)
+    ee_log("  UMCos: %.0f calls/s, %.0f range-reduction steps/s, %.1f calls/s over 64 steps, largest angle %.1f", c / 10.0, s / 10.0,
+           big / 10.0, (double)g_ssem_st.max);
+  for (i = 0; i < 8 && g_ssem_st.site[i].ra; i++) {
+    ee_log("    big calls from %p: %u", g_ssem_st.site[i].ra, g_ssem_st.site[i].n);
+    g_ssem_st.site[i].n = 0;
+  }
+  g_ssem_st.max = 0;
 }
 
 /* Jump fn to hook, keeping its first n bytes (whole instructions, position-
@@ -1045,6 +1167,60 @@ static void *ls_hook(unsigned char *fn, const unsigned char *want, int n, void *
   return tr;
 }
 
+/* ---- multimedia timers (EE_LOCK_STATS=1 logs them) ------------------------
+ * The engine's TMTimer is winmm timeSetEvent; the simulation ticks on a 33 ms
+ * TIME_PERIODIC|TIME_CALLBACK_EVENT_SET one.  Log every timer the engine
+ * creates and how long callback timers take: Wine runs all of a process's
+ * winmm timers on one thread, so a slow callback delays every other timer. */
+typedef MMRESULT(WINAPI *tse_fn)(UINT, UINT, LPTIMECALLBACK, DWORD_PTR, UINT);
+static tse_fn orig_timeSetEvent;
+static struct tcb {
+  LPTIMECALLBACK fn;
+  DWORD_PTR user;
+  UINT delay;
+  volatile LONG n, us, max;
+} ls_tcb[8];
+static volatile LONG ls_ntcb;
+
+static void CALLBACK ls_timer_thunk(UINT id, UINT msg, DWORD_PTR user, DWORD_PTR d1, DWORD_PTR d2) {
+  struct tcb *t = (struct tcb *)user;
+  LARGE_INTEGER a, b;
+  LONG us;
+  QueryPerformanceCounter(&a);
+  t->fn(id, msg, t->user, d1, d2);
+  QueryPerformanceCounter(&b);
+  us = ls_us(a, b);
+  InterlockedIncrement(&t->n);
+  InterlockedExchangeAdd(&t->us, us);
+  if (us > t->max)
+    t->max = us;
+}
+
+static MMRESULT WINAPI hook_timeSetEvent(UINT delay, UINT res, LPTIMECALLBACK fn, DWORD_PTR user, UINT flags) {
+  ee_log("timeSetEvent(%u ms, res %u, %s %p, flags 0x%x) from %p", delay, res,
+         (flags & 0x30) ? "event/pulse" : "callback", (void *)fn, flags, __builtin_return_address(0));
+  if (!(flags & 0x30) && fn) { /* TIME_CALLBACK_FUNCTION: time it */
+    LONG i = InterlockedIncrement(&ls_ntcb) - 1;
+    if (i < 8) {
+      ls_tcb[i].fn = fn;
+      ls_tcb[i].user = user;
+      ls_tcb[i].delay = delay;
+      return orig_timeSetEvent(delay, res, ls_timer_thunk, (DWORD_PTR)&ls_tcb[i], flags);
+    }
+  }
+  return orig_timeSetEvent(delay, res, fn, user, flags);
+}
+
+static void ls_log_timers(void) {
+  LONG i, n = ls_ntcb < 8 ? ls_ntcb : 8;
+  for (i = 0; i < n; i++) {
+    LONG c = InterlockedExchange(&ls_tcb[i].n, 0), us = InterlockedExchange(&ls_tcb[i].us, 0), mx = InterlockedExchange(&ls_tcb[i].max, 0);
+    if (c)
+      ee_log("  timer %p (%u ms): %.1f callbacks/s, %.2f ms each (max %.1f)", (void *)ls_tcb[i].fn, ls_tcb[i].delay, c / 10.0,
+             us / 1000.0 / c, mx / 1000.0);
+  }
+}
+
 static void install_lock_stats(HMODULE lle) {
   static const unsigned char wl[5] = {0x56, 0x8b, 0xf1, 0x8b, 0x0e};       /* push esi; mov esi,ecx; mov ecx,[esi] */
   static const unsigned char wu[6] = {0x56, 0x8b, 0xf1, 0x8b, 0x4e, 0x04}; /* ...; mov ecx,[esi+4] */
@@ -1057,6 +1233,10 @@ static void install_lock_stats(HMODULE lle) {
   tr_wunlock = (lockfn)ls_hook((unsigned char *)GetProcAddress(lle, "?WriteUnlock@TSReadWriteLock@@QAEXXZ"), wu, 6, (void *)ls_wunlock);
   tr_rlock = (lockfn)ls_hook((unsigned char *)GetProcAddress(lle, "?ReadLock@TSReadWriteLock@@QAEXXZ"), rl, 6, (void *)ls_rlock);
   ee_log("world lock stats: %s", tr_wlock && tr_wunlock && tr_rlock ? "on (every 10 s)" : "could not hook all three");
+  g_ssem_st.on = 1;
+  orig_timeSetEvent = (tse_fn)(void *)GetProcAddress(GetModuleHandleA("winmm.dll"), "timeSetEvent");
+  if (orig_timeSetEvent)
+    patch_iat(lle, "winmm.dll", "timeSetEvent", (void *)hook_timeSetEvent);
 }
 
 static void install_render_sleep(void) {
@@ -1119,6 +1299,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
     }
     install_render_sleep();
     install_lock_stats(GetModuleHandleA("Low-Level Engine.dll"));
+    ct_install(ee_log); /* EE_CALLTIME (with EE_LOCK_STATS=1): see ee-calltime.h */
+    sh_install(ee_log); /* EE_SIMHASH=1: per-tick world checksum, see ee-calltime.h */
+    share_install(ee_log); /* EE_PHYSICS_SHARE=<percent> */
     load_real();
   }
   return TRUE;

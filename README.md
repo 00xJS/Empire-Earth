@@ -26,6 +26,12 @@ the Scenario Editor opens (in its own 800×600 mode).
 A Gigantic random map loads in about 16 seconds, and the load carries on while
 you are in another app.
 
+Big battles hold 90+ FPS. The benchmark is a late-game save of a custom map:
+367 units, a crowd of 150 soldiers on screen, about 1,100 objects moving.
+It runs at **95 FPS** (10th percentile 91) with the game's Animation Smoothing
+on, and 104 with it off. At the start of this work it managed 58 with smoothing
+off and 51 with it on. See [Big battles](#big-battles-the-engines-maths-on-sse2).
+
 ## Requirements
 
 - Apple Silicon Mac (macOS 14 or later)
@@ -128,10 +134,54 @@ Two related fixes:
   of OpenGL every time the game locked the screen to draw its text, which it does
   every frame. The proxy now does those blits on the CPU. That removed about 30%
   of each match frame and took an early match from about 75 FPS to over 100.
-- **Animation Smoothing off.** The game blends every unit's animation between
-  keyframes on the CPU, in old x87 code that Rosetta runs slowly; with 150+
-  units on screen that was half of every frame. The launcher turns it off (the
-  game only has it as a registry setting), so units step between poses.
+
+### Big battles: the engine's maths on SSE2
+
+Empire Earth was built with Visual C++ 6 and does all its floating point on the
+x87 FPU. Apple Silicon has no x87, so Rosetta 2 emulates it in software. On an
+M2 Pro one x87 operation costs about 30 ns, around 100 times its SSE2 equivalent.
+In big battles the game's own maths was the bottleneck, not the GPU.
+
+The `version.dll` proxy rewrites the hottest of that code in SSE2, bit for bit:
+
+- **Engine maths** in `Low-Level Engine.dll`: point, vector and matrix
+  transforms, plane tests, the cosine table, bounding boxes, orientations and
+  line intersections (17 functions).
+- **Two loops in the renderer:** the terrain vertex fill, and Animation
+  Smoothing's keyframe blend.
+
+Each replacement repeats the original's operations in the same order and
+rounding. It picks double or single precision on every call from the calling
+thread's x87 control word, just as the x87 would have rounded, and it is only
+installed after the function's bytes are checked. `diagnostics/ssemath-test.exe`
+runs every replacement against the game's own DLLs on hundreds of thousands of
+random inputs, at both precisions and all four rounding modes, and requires
+identical bits. `EE_SSE_MATH=0` turns it all off.
+
+| Heavy battle benchmark (custom map, late game) | FPS (avg / 10th pct) |
+|---|---|
+| Start, 25 Sep 2026 (Animation Smoothing off) | 58.5 / 56.5 |
+| Engine maths on SSE2 | 72.7 / 67.9 |
+| + no 1 ms sleep per frame in the render loop | 79.8 / 76.8 |
+| + terrain vertex fill on SSE2 (and more engine maths) | 92.8 / 89.7 |
+| Now, Animation Smoothing off | 103.9 / 99.9 |
+| **Now, Animation Smoothing on (the default)** | **95.0 / 91.3** |
+
+**Animation Smoothing** blends every unit's model between animation keyframes,
+every frame. Without it, walk and attack cycles step from pose to pose and look
+slow and jerky. Its x87 loop cost 626 ns per vertex under Rosetta, half of every
+frame with 150+ units on screen, so the launcher used to turn it off. On SSE2 it
+costs 4 ns, and the launcher now turns it on (`EE_ANIMATION_SMOOTHING=0` for the
+last few FPS).
+
+**The simulation keeps the same speed however busy the map is.** It runs on
+its own thread, and the game's synchronous server (built for multiplayer, used
+in single player too) sets how many physics steps it takes per second:
+`ticks/s = 10 × 30 / (average tick ms)`. That keeps the simulation to 30% of
+one CPU. Each step covers proportionally more game time, so the game runs at
+normal speed either way (measured: the same distance moved per second at 24 and
+at 94 steps a second). What changes is how finely movement is stepped. A heavy
+map steps units about 25 times a second instead of 30.
 
 ### The bug that blocked this for months
 
@@ -281,7 +331,14 @@ committed here.
 | `EE_DDRAW_SYNC_ACTIVATEAPP=1` | deliver "focus lost" to the game at once again (can freeze it when you switch apps) |
 | `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
 | `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
-| `EE_ANIMATION_SMOOTHING=1` | turn the game's Animation Smoothing back on (off by default: with 150+ units on screen it cost half of every frame under Rosetta) |
+| `EE_ANIMATION_SMOOTHING=0` | turn the game's Animation Smoothing off: units step between animation poses; about 9% more FPS in big battles |
+| `EE_SSE_MATH=0` | run the engine's and renderer's original x87 code instead of the SSE2 rewrites (much slower in big battles) |
+| `EE_RENDER_SLEEP=1` | keep the render loop's 1 ms sleep after every frame (it now only yields the CPU) |
+| `EE_DDRAW_MATCH_GETDC=0` | only a `Lock` of the back buffer marks a match frame again, not `GetDC` (every match frame then pays the full page exchange) |
+| `EE_LOCK_STATS=1` | log the simulation's world-lock timings, tick rate and timers to `ee-version.log` every 10 s |
+| `EE_CALLTIME=<addresses>` | with `EE_LOCK_STATS=1`: time the listed call instructions in the game (diagnostics, see `patches/win32/ee-calltime.h`) |
+| `EE_SIMHASH=1` | log a checksum of every unit after each simulation step (compares builds; pins the simulation at its fastest rate) |
+| `EE_PHYSICS_SHARE=<percent>` | the share of a CPU the simulation may use (the game's own is 30): higher steps units more finely, at the cost of FPS |
 | `EE_DDRAW_PAGES=0` | stop the proxy's page flipping (brings back the menu cursor trails) |
 | `EE_DDRAW_SOFTBLT=0` | run the game's flip-chain blits on the GPU again (slower) |
 | `EE_WINED3D_CSMT=1` | turn wined3d's command-stream thread back on |

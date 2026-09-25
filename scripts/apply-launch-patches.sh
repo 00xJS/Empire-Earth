@@ -689,13 +689,16 @@ reg "HKCU\\Software\\SSSI\\Empire Earth" "Game Window Height" "REG_DWORD" "${EE_
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Rasterizer Name" "REG_SZ" "Direct3D Hardware TnL"
 reg "HKCU\\Software\\SSSI\\Empire Earth" "UseCandidateWindow" "REG_DWORD" "0"
 # Animation Smoothing blends every visible unit's vertices between animation
-# keyframes on the CPU, every frame, in x87 code that Rosetta runs slowly: with
-# 150+ units on screen it took half of each frame and the game fell to ~9 FPS
-# (ee-prof, 23 Sep 2026).  Off, units step between keyframes.  The game has no
-# menu option for it (registry only; it rewrites the value on exit, so set it on
-# every launch).  EE_ANIMATION_SMOOTHING=1 turns it back on.
-reg "HKCU\\Software\\SSSI\\Empire Earth" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-0}"
-reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-0}"
+# keyframes on the CPU, every frame.  In the renderer's x87 code, which Rosetta
+# emulates, that took half of each frame with 150+ units on screen (23 Sep
+# 2026), so it was off and units stepped between keyframes -- walk and attack
+# cycles looked slow and jerky.  ee-version now runs those two loops on SSE2,
+# bit for bit the same (diagnostics/ssemath-test.exe): 626 -> 4 ns a vertex,
+# and the big-battle benchmark is as fast with it as without.  The game has no
+# menu option for it (registry only; it rewrites the value on exit, so set it
+# on every launch).  EE_ANIMATION_SMOOTHING=0 turns it off.
+reg "HKCU\\Software\\SSSI\\Empire Earth" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-1}"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-1}"
 # Art of Conquest keeps its own copy of every display setting.  Left at its
 # defaults (16-bit colour and textures, 800x600) it drew one frame and then hung
 # in Wine's OpenGL ddraw path on a black screen (23 Sep 2026).

@@ -21,9 +21,28 @@
 #define SSEM_THIS __attribute__((thiscall))
 
 static struct {
-  float cos_lo, cos_step, cos_hi, cos_scale, half_pi;
+  float cos_lo, cos_step, cos_hi, cos_scale, half_pi, terrain_k;
   const float *cos_table;
 } g_ssem;
+
+/* UMCos statistics (on with EE_LOCK_STATS=1): its range reduction steps the
+ * angle by 2 pi at a time, so huge angles cost one loop step per turn.  Racy
+ * counters -- statistics only; nothing here touches the arithmetic. */
+static struct {
+  int on;
+  volatile unsigned calls, steps, big; /* big: calls over 64 steps */
+  float max;                           /* largest |angle| */
+  struct { void *ra; unsigned n; } site[8]; /* the game's call sites of big calls */
+} g_ssem_st;
+static void ssem_st_site(void *ra) {
+  int i;
+  for (i = 0; i < 8; i++)
+    if (g_ssem_st.site[i].ra == ra || !g_ssem_st.site[i].ra) {
+      g_ssem_st.site[i].ra = ra;
+      g_ssem_st.site[i].n++;
+      return;
+    }
+}
 
 /* The calling thread's x87 control word: precision in bits 8-9 (00 = 24-bit,
  * 10 = 53, 11 = 64), rounding in 10-11.  0.4 ns under Rosetta, so every call
@@ -82,12 +101,37 @@ static int SSEM_THIS ssem_above(const float *pl, const float *pt) {
 static int SSEM_THIS ssem_below(const float *pl, const float *pt) {
   return SSEM_PC24() ? ssem_below_f(pl, pt) : ssem_below_d(pl, pt);
 }
-static float ssem_umcos(float a) { return SSEM_PC24() ? ssem_umcos_f(a) : ssem_umcos_d(a); }
+static float ssem_umcos(float a) {
+  const unsigned big = g_ssem_st.big;
+  const float r = SSEM_PC24() ? ssem_umcos_f(a) : ssem_umcos_d(a);
+  if (g_ssem_st.on && g_ssem_st.big != big)
+    ssem_st_site(__builtin_return_address(0));
+  return r;
+}
 static void SSEM_THIS ssem_bbox_dims(float *b) {
   if (SSEM_PC24()) ssem_bbox_dims_f(b); else ssem_bbox_dims_d(b);
 }
 static void SSEM_THIS ssem_ypr(float *m, float a, float b, float c) {
+  const unsigned big = g_ssem_st.big;
   if (SSEM_PC24()) ssem_ypr_f(m, a, b, c); else ssem_ypr_d(m, a, b, c);
+  if (g_ssem_st.on && g_ssem_st.big != big)
+    ssem_st_site(__builtin_return_address(0));
+}
+static int SSEM_THIS ssem_line_plane(const float *L, const float *pl, float *t) {
+  return SSEM_PC24() ? ssem_line_plane_f(L, pl, t) : ssem_line_plane_d(L, pl, t);
+}
+static void SSEM_THIS ssem_line_dir(float *L, const float *q) {
+  if (SSEM_PC24()) ssem_line_dir_f(L, q); else ssem_line_dir_d(L, q);
+}
+/* The two smoothing loops are thiscall with three stack arguments; `this' (the
+ * rasterizer) is not used. */
+static void SSEM_THIS ssem_smooth_std(void *self, const char *model, const char *mat, char *out) {
+  (void)self;
+  if (SSEM_PC24()) ssem_smooth_f(model, mat, out, 0); else ssem_smooth_d(model, mat, out, 0);
+}
+static void SSEM_THIS ssem_smooth_color(void *self, const char *model, const char *mat, char *out) {
+  (void)self;
+  if (SSEM_PC24()) ssem_smooth_f(model, mat, out, 1); else ssem_smooth_d(model, mat, out, 1);
 }
 /* ??0GE3DPlane@@QAE@XZ (rva 0x32c9): point 0,0,0, normal 0,0,1; returns this. */
 static void *SSEM_THIS ssem_plane_ctor(float *p) {
@@ -140,6 +184,8 @@ static const struct ssem_patch g_ssem_patches[] = {
     {"??0GEBoundingBox@@QAE@XZ", 41, 0x895a38a8, (void *)ssem_bbox_ctor},
     SSEM_P("?ComputeDimensions@GEBoundingBox@@AAEXXZ", 105, 0x46cedc3a, bbox_dims),
     SSEM_P("?SetOrientationYPR@GETransformation@@QAEXMMM@Z", 244, 0x57ef8956, ypr),
+    SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPlane@@AAM@Z", 111, 0x0d9d1aad, line_plane),
+    SSEM_P("?ComputeDirection@GE3DLine@@AAEXABVGE3DPoint@@@Z", 38, 0xeaab56a4, line_dir),
 };
 #define SSEM_N ((int)(sizeof g_ssem_patches / sizeof g_ssem_patches[0]))
 
@@ -167,7 +213,7 @@ static void ssem_bind(HMODULE lle) {
 static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len) {
   const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
   const IMAGE_DATA_DIRECTORY *rd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-  unsigned char buf[512];
+  unsigned char buf[1024];
   if (len > sizeof buf)
     return 0;
   memcpy(buf, base + rva, len);
@@ -220,6 +266,110 @@ static int ee_ssemath_install(HMODULE lle, void (*logf)(const char *fmt, ...)) {
       continue;
     }
     rel = (int)((char *)p->to - ((char *)fn + 5));
+    fn[0] = 0xE9;
+    memcpy(fn + 1, &rel, 4);
+    VirtualProtect(fn, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn, 5);
+    n++;
+  }
+  return n;
+}
+
+/* ---- DrawTerrainMaterial's vertex loop (DX7HRTnLDisplay.dll) --------------
+ * The loop start (mov eax,[edx]; test; je exit) is replaced by a jump to
+ * ssem_tstub, which fills every polygon's vertices in one go and resumes at the
+ * loop's exit -- the vertex-buffer unlock and DrawPrimitive stay the game's.
+ * Nothing after the loop reads the registers it used (edx, eax, ecx, edi) or
+ * the output pointer at [ebp+0xc]. */
+#define SSEM_TNL_DTM "?DrawTerrainMaterial@DX7Rasterizer@@MAEJPAVGEViewport@@AAV?$vector@PAUGETMPolygon@GETerrainMesh@@V?$allocator@PAUGETMPolygon@GETerrainMesh@@@std@@@std@@K@Z"
+void ssem_tfill(const char *const *polys, char *out) {
+  if (SSEM_PC24()) ssem_tfill_f(polys, out); else ssem_tfill_d(polys, out);
+}
+void *ssem_tresume;
+void ssem_tstub(void);
+__asm__(".text\n.globl _ssem_tstub\n_ssem_tstub:\n"
+        "\tpushal\n"
+        "\tpushl 0xc(%ebp)\n" /* the output pointer, in the game function's frame */
+        "\tpushl %edx\n"      /* the polygon iterator */
+        "\tcall _ssem_tfill\n"
+        "\taddl $8, %esp\n"
+        "\tpopal\n"
+        "\tjmp *_ssem_tresume\n");
+
+/* Returns 1 when the loop was redirected, 2 when it already was (the game
+ * LoadLibrary's its renderers several times; a module that stays resident keeps
+ * the patch, and one that was freed and reloaded comes back as the original
+ * code and gets patched again), 0 when left alone.  dx7 = a DX7HR*Display.dll:
+ * DX7HRDisplay exports the same method with different code and is left alone. */
+static int ee_ssemath_terrain(HMODULE dx7, void (*logf)(const char *fmt, ...)) {
+  static const unsigned char loop[10] = {0x8b, 0x02, 0x85, 0xc0, 0x0f, 0x84, 0x29, 0x02, 0x00, 0x00};
+  static unsigned logged;
+  unsigned char *fn = (unsigned char *)GetProcAddress(dx7, SSEM_TNL_DTM), *at;
+  unsigned h;
+  DWORD old;
+  int rel;
+  if (!fn)
+    return 0;
+  at = fn + 0x71;
+  memcpy(&rel, at + 1, 4);
+  if (at[0] == 0xE9 && at + 5 + rel == (unsigned char *)ssem_tstub)
+    return 2;
+  h = ssem_hash((const unsigned char *)dx7, (DWORD)(fn - (unsigned char *)dx7), 766);
+  if (h != 0xbbc21f08u || memcmp(at, loop, sizeof loop)) {
+    if (h != logged)
+      logf("sse maths: DrawTerrainMaterial is not the reversed code (fnv 0x%08x) -- left alone", h);
+    logged = h;
+    return 0;
+  }
+  g_ssem.terrain_k = *(const float *)((const char *)dx7 + 0x106fc);
+  ssem_tresume = fn + 0x2a4;
+  if (!VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old))
+    return 0;
+  rel = (int)((char *)ssem_tstub - (char *)(at + 5));
+  at[0] = 0xE9;
+  memcpy(at + 1, &rel, 4);
+  VirtualProtect(at, 5, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), at, 5);
+  return 1;
+}
+
+/* ---- Animation Smoothing's keyframe blend (DX7HRTnLDisplay.dll) ------------
+ * With 150+ animated units on screen the two x87 loops took half of every
+ * frame (23 Sep 2026), so the launcher had turned Animation Smoothing off and
+ * units stepped between keyframes.  Jumps each entry to its SSE version; like
+ * the terrain loop it recognises its own jump when the renderer is loaded
+ * again.  Returns how many of the two are redirected (already or now). */
+#define SSEM_SMOOTH_STD "?CopyAndSmoothStdVertices@DX7Rasterizer@@IAEXPAVGEModel@@PAVGEMaterial@@PAUD3DVERTEX_STD_COLOR@@@Z"
+#define SSEM_SMOOTH_COL "?CopyAndSmoothStdColorVertices@DX7Rasterizer@@IAEXPAVGEModel@@PAVGEMaterial@@PAUD3DVERTEX_STD_COLOR@@@Z"
+static int ee_ssemath_smooth(HMODULE dx7, void (*logf)(const char *fmt, ...)) {
+  static const struct { const char *name; unsigned len, fnv; void *to; } fns[2] = {
+      {SSEM_SMOOTH_STD, 201, 0x83b22387u, (void *)ssem_smooth_std},
+      {SSEM_SMOOTH_COL, 207, 0xc16eda13u, (void *)ssem_smooth_color},
+  };
+  static unsigned logged;
+  int i, n = 0;
+  for (i = 0; i < 2; i++) {
+    unsigned char *fn = (unsigned char *)GetProcAddress(dx7, fns[i].name);
+    unsigned h;
+    DWORD old;
+    int rel;
+    if (!fn)
+      continue;
+    memcpy(&rel, fn + 1, 4);
+    if (fn[0] == 0xE9 && fn + 5 + rel == (unsigned char *)fns[i].to) {
+      n++;
+      continue;
+    }
+    h = ssem_hash((const unsigned char *)dx7, (DWORD)(fn - (unsigned char *)dx7), fns[i].len);
+    if (h != fns[i].fnv) {
+      if (h != logged)
+        logf("sse maths: %.40s is not the reversed code (fnv 0x%08x) -- left alone", fns[i].name, h);
+      logged = h;
+      continue;
+    }
+    if (!VirtualProtect(fn, 5, PAGE_EXECUTE_READWRITE, &old))
+      continue;
+    rel = (int)((unsigned char *)fns[i].to - (fn + 5));
     fn[0] = 0xE9;
     memcpy(fn + 1, &rel, 4);
     VirtualProtect(fn, 5, old, &old);
