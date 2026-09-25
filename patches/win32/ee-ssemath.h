@@ -23,6 +23,10 @@
 static struct {
   float cos_lo, cos_step, cos_hi, cos_scale, half_pi, terrain_k;
   const float *cos_table;
+  /* UMArcCos / UMArcTan2 */
+  float ac_lim, ac_scale, ac_c3, ac_c4, ac_c5, ac_clamp, ac_pi, ac_nhalf_pi;
+  const float *ac_table;
+  double(__cdecl *crt_sqrt)(double); /* the DLL's msvcrt sqrt, through its import table */
 } g_ssem;
 
 /* UMCos statistics (on with EE_LOCK_STATS=1): its range reduction steps the
@@ -123,6 +127,14 @@ static int SSEM_THIS ssem_line_plane(const float *L, const float *pl, float *t) 
 static void SSEM_THIS ssem_line_dir(float *L, const float *q) {
   if (SSEM_PC24()) ssem_line_dir_f(L, q); else ssem_line_dir_d(L, q);
 }
+static double ssem_umacos(float x) { return SSEM_PC24() ? (double)ssem_umacos_f(x) : ssem_umacos_d(x); }
+static double ssem_umatan2(float a, float b) { return SSEM_PC24() ? (double)ssem_umatan2_f(a, b) : ssem_umatan2_d(a, b); }
+static int SSEM_THIS ssem_line_sphere(const float *L, const float *P, float r, float *t) {
+  return SSEM_PC24() ? ssem_line_sphere_f(L, P, r, t) : ssem_line_sphere_d(L, P, r, t);
+}
+static double SSEM_THIS ssem_meshz(const char *mesh, float x, float y) {
+  return SSEM_PC24() ? (double)ssem_meshz_f(mesh, x, y) : ssem_meshz_d(mesh, x, y);
+}
 /* The two smoothing loops are thiscall with three stack arguments; `this' (the
  * rasterizer) is not used. */
 static void SSEM_THIS ssem_smooth_std(void *self, const char *model, const char *mat, char *out) {
@@ -186,6 +198,10 @@ static const struct ssem_patch g_ssem_patches[] = {
     SSEM_P("?SetOrientationYPR@GETransformation@@QAEXMMM@Z", 244, 0x57ef8956, ypr),
     SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPlane@@AAM@Z", 111, 0x0d9d1aad, line_plane),
     SSEM_P("?ComputeDirection@GE3DLine@@AAEXABVGE3DPoint@@@Z", 38, 0xeaab56a4, line_dir),
+    SSEM_P("?GetMeshZ@GETerrainMesh@@QBEMMM@Z", 242, 0x458f79b6, meshz),
+    SSEM_P("?UMArcCos@@YAMM@Z", 224, 0xe66c78d8, umacos),
+    SSEM_P("?UMArcTan2@@YAMMM@Z", 109, 0x542763d1, umatan2),
+    SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPoint@@MAAM@Z", 392, 0x4add5f40, line_sphere),
 };
 #define SSEM_N ((int)(sizeof g_ssem_patches / sizeof g_ssem_patches[0]))
 
@@ -203,6 +219,16 @@ static void ssem_bind(HMODULE lle) {
   g_ssem.cos_step = *(const float *)(b + 0x96538);
   g_ssem.cos_hi = *(const float *)(b + 0x9653c);
   g_ssem.cos_scale = *(const float *)(b + 0x96744);
+  g_ssem.ac_lim = *(const float *)(b + 0x96754);
+  g_ssem.ac_scale = *(const float *)(b + 0x96758);
+  g_ssem.ac_c3 = *(const float *)(b + 0x96748);
+  g_ssem.ac_c4 = *(const float *)(b + 0x9674c);
+  g_ssem.ac_c5 = *(const float *)(b + 0x96750);
+  g_ssem.ac_clamp = *(const float *)(b + 0x96504);
+  g_ssem.ac_pi = *(const float *)(b + 0x9653c);
+  g_ssem.ac_nhalf_pi = *(const float *)(b + 0x96760);
+  g_ssem.ac_table = (const float *)(b + 0xe9134);
+  g_ssem.crt_sqrt = *(double(__cdecl **)(double))(b + 0x9424c);
   g_ssem.cos_table = (const float *)(b + 0xd9130);
   g_ssem.half_pi = *(const float *)(b + 0x94818);
 }

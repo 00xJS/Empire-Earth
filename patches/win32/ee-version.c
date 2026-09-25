@@ -508,6 +508,7 @@ static void patch_rasterizer(HMODULE mod) {
       int n;
       if (ee_ssemath_terrain(mod, ee_log) == 1)
         ee_log("sse maths: DrawTerrainMaterial's vertex loop redirected to SSE2 (module %p)", (void *)mod);
+      ft_install("tnl", mod, ee_log); /* EE_FUNCTIME tnl:<export> */
       n = ee_ssemath_smooth(mod, ee_log);
       if (n && mod != smooth_logged[0] && mod != smooth_logged[1]) {
         smooth_logged[smooth_logged[0] ? 1 : 0] = mod;
@@ -1081,6 +1082,7 @@ static void __attribute__((thiscall)) ls_wunlock(void *self) {
       ls_log_readers();
       ls_log_umcos();
       ct_report(ee_log, 10.0);
+      ft_report(ee_log);
     }
     ct_set_thread(top);
     memset(ls_gap, 0, sizeof ls_gap);
@@ -1105,6 +1107,8 @@ static void __attribute__((thiscall)) ls_rlock(void *self) {
   for (i = 0; i < 8; i++)
     if (ls_rd[i].tid == t || InterlockedCompareExchange(&ls_rd[i].tid, t, 0) == 0) {
       void *ra = __builtin_return_address(0);
+      if (ra == (void *)0x4feda6) /* the render loop's per-frame read of the world */
+        ft_render_tid = (DWORD)t;
       InterlockedIncrement(&ls_rd[i].n);
       InterlockedExchangeAdd(&ls_rd[i].us, us);
       if (ls_rd[i].ra == ra)
@@ -1302,6 +1306,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
     ct_install(ee_log); /* EE_CALLTIME (with EE_LOCK_STATS=1): see ee-calltime.h */
     sh_install(ee_log); /* EE_SIMHASH=1: per-tick world checksum, see ee-calltime.h */
     share_install(ee_log); /* EE_PHYSICS_SHARE=<percent> */
+    ft_install("lle", GetModuleHandleA("Low-Level Engine.dll"), ee_log); /* EE_FUNCTIME */
+    ft_install("exe", NULL, ee_log);
     load_real();
   }
   return TRUE;

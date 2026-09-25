@@ -28,8 +28,8 @@ you are in another app.
 
 Big battles hold 90+ FPS. The benchmark is a late-game save of a custom map:
 367 units, a crowd of 150 soldiers on screen, about 1,100 objects moving.
-It runs at **95 FPS** (10th percentile 91) with the game's Animation Smoothing
-on, and 104 with it off. At the start of this work it managed 58 with smoothing
+It runs at **101 FPS** (10th percentile 96) with the game's Animation
+Smoothing on. At the start of this work it managed 58 with smoothing
 off and 51 with it on. See [Big battles](#big-battles-the-engines-maths-on-sse2).
 
 ## Requirements
@@ -144,9 +144,10 @@ In big battles the game's own maths was the bottleneck, not the GPU.
 
 The `version.dll` proxy rewrites the hottest of that code in SSE2, bit for bit:
 
-- **Engine maths** in `Low-Level Engine.dll`: point, vector and matrix
-  transforms, plane tests, the cosine table, bounding boxes, orientations and
-  line intersections (17 functions).
+- **Engine maths** in `Low-Level Engine.dll` (21 functions): point, vector
+  and matrix transforms, plane tests, cosine, arc-cosine and arc-tangent,
+  bounding boxes, orientations, line-plane and line-sphere intersections, and
+  terrain height.
 - **Two loops in the renderer:** the terrain vertex fill, and Animation
   Smoothing's keyframe blend.
 
@@ -164,8 +165,8 @@ identical bits. `EE_SSE_MATH=0` turns it all off.
 | Engine maths on SSE2 | 72.7 / 67.9 |
 | + no 1 ms sleep per frame in the render loop | 79.8 / 76.8 |
 | + terrain vertex fill on SSE2 (and more engine maths) | 92.8 / 89.7 |
-| Now, Animation Smoothing off | 103.9 / 99.9 |
-| **Now, Animation Smoothing on (the default)** | **95.0 / 91.3** |
+| + Animation Smoothing on SSE2, switched back on | 95.0 / 91.3 |
+| **+ terrain height, arc functions, line-sphere test (now)** | **101.1 / 95.9** |
 
 **Animation Smoothing** blends every unit's model between animation keyframes,
 every frame. Without it, walk and attack cycles step from pose to pose and look
@@ -337,6 +338,7 @@ committed here.
 | `EE_DDRAW_MATCH_GETDC=0` | only a `Lock` of the back buffer marks a match frame again, not `GetDC` (every match frame then pays the full page exchange) |
 | `EE_LOCK_STATS=1` | log the simulation's world-lock timings, tick rate and timers to `ee-version.log` every 10 s |
 | `EE_CALLTIME=<addresses>` | with `EE_LOCK_STATS=1`: time the listed call instructions in the game (diagnostics, see `patches/win32/ee-calltime.h`) |
+| `EE_FUNCTIME=<list>` | with `EE_LOCK_STATS=1`: time whole engine or renderer functions (`lle:<export>`, `tnl:<export>`, `exe:<hex>`), render thread apart from the rest |
 | `EE_SIMHASH=1` | log a checksum of every unit after each simulation step (compares builds; pins the simulation at its fastest rate) |
 | `EE_PHYSICS_SHARE=<percent>` | the share of a CPU the simulation may use (the game's own is 30): higher steps units more finely, at the cost of FPS |
 | `EE_DDRAW_PAGES=0` | stop the proxy's page flipping (brings back the menu cursor trails) |

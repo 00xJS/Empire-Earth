@@ -388,3 +388,206 @@ static void share_install(void (*logf)(const char *fmt, ...)) {
   FlushInstructionCache(GetCurrentProcess(), at, 5);
   logf("physics share: %d%% of a CPU (the game's is 30%%)", pct);
 }
+
+/* ---- function timing (EE_FUNCTIME, diagnostics) -----------------------------
+ * EE_FUNCTIME=<spec>,<spec>,... times whole functions, inclusive: exports of
+ * Low-Level Engine.dll ("lle:<name>"), of the Direct3D renderers ("tnl:<name>",
+ * hooked in each renderer as it loads) or code in the exe ("exe:<hex>").  The
+ * entry jumps to a thunk that notes the caller's return address and rdtsc on a
+ * per-thread shadow stack, puts its own exit thunk in as the return address
+ * and runs the function from a trampoline (its first instructions, copied;
+ * only position-independent prologue instructions are accepted).  Calls on the
+ * render thread (the one that reads the world from 0x4feda6) are counted apart
+ * from the rest.  Engine and renderer code never longjmps, which keeps the
+ * shadow stack balanced; game code that might is not a safe target.  Needs
+ * EE_LOCK_STATS=1 (reports ride on its 10 s lines). */
+#define FT_MAX 40
+static struct ft_fn {
+  unsigned char *fn;
+  char name[48];
+  volatile LONG n[2];
+  volatile LONGLONG cyc[2];
+} ft_fns[FT_MAX];
+static volatile LONG ft_n;
+static volatile DWORD ft_render_tid;
+static DWORD ft_tls = TLS_OUT_OF_INDEXES;
+static LONGLONG ft_q0, ft_c0;
+static char ft_spec[8192];
+struct ft_stack { int sp; struct { int i; void *ret; unsigned long long t0; } e[128]; };
+
+static inline struct ft_stack *ft_get(void) {
+  struct ft_stack *s;
+  __asm__ volatile("movl %%fs:0xe10(,%1,4), %0" : "=r"(s) : "r"(ft_tls));
+  return s;
+}
+static void __cdecl ft_begin(int i, void *ret) {
+  struct ft_stack *s = ft_get();
+  if (!s) {
+    DWORD e = GetLastError();
+    s = (struct ft_stack *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *s);
+    TlsSetValue(ft_tls, s);
+    SetLastError(e);
+  }
+  if (s->sp < 128) {
+    s->e[s->sp].i = i;
+    s->e[s->sp].ret = ret;
+    s->e[s->sp].t0 = __builtin_ia32_rdtsc();
+  }
+  s->sp++; /* past 128 the return address is lost: never that deep in engine code */
+}
+static void *__cdecl ft_end(int i) {
+  const unsigned long long t = __builtin_ia32_rdtsc();
+  struct ft_stack *s = ft_get();
+  int k = s->sp - 1;
+  while (k > 0 && s->e[k].i != i) /* skip frames left by an unwound call */
+    k--;
+  s->sp = k;
+  {
+    const int r = ct_self() == ft_render_tid ? 0 : 1;
+    InterlockedIncrement(&ft_fns[i].n[r]);
+    InterlockedExchangeAdd64(&ft_fns[i].cyc[r], (LONGLONG)(t - s->e[k].t0));
+  }
+  return s->e[k].ret;
+}
+
+/* Length of one position-independent prologue instruction, 0 if unsure. */
+static int ft_modrm(const unsigned char *q) {
+  const int mod = q[0] >> 6, rm = q[0] & 7;
+  if (mod == 3) return 1;
+  if (mod == 0) return rm == 4 ? ((q[1] & 7) == 5 ? 6 : 2) : rm == 5 ? 5 : 1;
+  return (mod == 1 ? 2 : 5) + (rm == 4);
+}
+static int ft_len(const unsigned char *p) {
+  switch (p[0]) {
+  case 0x50: case 0x51: case 0x52: case 0x53: case 0x55: case 0x56: case 0x57: return 1;
+  case 0x6A: return 2;
+  case 0x68: case 0xA1: case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBE: case 0xBF: return 5;
+  case 0x03: case 0x0B: case 0x23: case 0x2B: case 0x33: case 0x3B: case 0x85: case 0x89: case 0x8B: case 0x8D:
+    return 1 + ft_modrm(p + 1);
+  case 0x83: return 2 + ft_modrm(p + 1);
+  case 0x81: return 5 + ft_modrm(p + 1);
+  case 0xD8: case 0xD9: case 0xDC: case 0xDD: return 1 + ft_modrm(p + 1);
+  case 0x64: return p[1] == 0xA1 ? 6 : 0;
+  case 0xFF: return ((p[1] >> 3) & 7) == 6 ? 1 + ft_modrm(p + 1) : 0; /* push r/m32 */
+  }
+  return 0;
+}
+
+static void ft_hook(unsigned char *fn, const char *name, void (*logf)(const char *fmt, ...)) {
+  unsigned char *code, *p, *tramp, *exitp;
+  int n = 0, i;
+  DWORD old;
+  if (!fn || ft_n >= FT_MAX)
+    return;
+  while (n < 5) {
+    const int l = ft_len(fn + n);
+    if (!l) {
+      logf("functime: %s at %p starts with %02x %02x %02x -- not hooked", name, (void *)fn, fn[n], fn[n + 1], fn[n + 2]);
+      return;
+    }
+    n += l;
+  }
+  code = VirtualAlloc(NULL, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  if (!code)
+    return;
+  i = ft_n;
+  ft_fns[i].fn = fn;
+  lstrcpynA(ft_fns[i].name, name, sizeof ft_fns[i].name);
+  tramp = code + 48;
+  exitp = code + 80;
+  /* entry: push eax,ecx,edx / push [esp+12] / push i / call ft_begin / add esp,8 /
+   * pop edx,ecx,eax / mov [esp],exit / jmp tramp */
+  p = code;
+  *p++ = 0x50; *p++ = 0x51; *p++ = 0x52;
+  *p++ = 0xFF; *p++ = 0x74; *p++ = 0x24; *p++ = 0x0C;
+  p = ct_push_imm(p, i);
+  p = ct_emit32(p, 0xE8, (void *)ft_begin);
+  *p++ = 0x83; *p++ = 0xC4; *p++ = 0x08;
+  *p++ = 0x5A; *p++ = 0x59; *p++ = 0x58;
+  *p++ = 0xC7; *p++ = 0x04; *p++ = 0x24;
+  memcpy(p, &exitp, 4);
+  p += 4;
+  ct_emit32(p, 0xE9, tramp);
+  /* trampoline: the first n bytes, then back into the function */
+  memcpy(tramp, fn, n);
+  ct_emit32(tramp + n, 0xE9, fn + n);
+  /* exit: push eax,edx / push i / call ft_end / add esp,4 / mov ecx,eax / pop edx,eax / jmp ecx */
+  p = exitp;
+  *p++ = 0x50; *p++ = 0x52;
+  p = ct_push_imm(p, i);
+  p = ct_emit32(p, 0xE8, (void *)ft_end);
+  *p++ = 0x83; *p++ = 0xC4; *p++ = 0x04;
+  *p++ = 0x89; *p++ = 0xC1;
+  *p++ = 0x5A; *p++ = 0x58;
+  *p++ = 0xFF; *p++ = 0xE1;
+  if (!VirtualProtect(fn, 5, PAGE_EXECUTE_READWRITE, &old))
+    return;
+  ct_emit32(fn, 0xE9, code);
+  VirtualProtect(fn, 5, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), fn, 5);
+  InterlockedIncrement(&ft_n);
+}
+
+/* Hooks every spec with the given prefix ("lle", "tnl", "exe") in module mod
+ * (NULL for "exe").  A renderer loaded again keeps its hooks: an entry that
+ * already jumps into our memory is skipped. */
+static void ft_install(const char *prefix, HMODULE mod, void (*logf)(const char *fmt, ...)) {
+  static char spec[8192];
+  char *tok;
+  const size_t pl = strlen(prefix);
+  if (!ft_spec[0] && !GetEnvironmentVariableA("EE_FUNCTIME", ft_spec, sizeof ft_spec))
+    return;
+  if (ft_tls == TLS_OUT_OF_INDEXES) {
+    ft_tls = TlsAlloc();
+    if (ft_tls >= 64) {
+      logf("functime: no TLS slot under 64 -- off");
+      ft_spec[0] = 0;
+      return;
+    }
+    {
+      LARGE_INTEGER q;
+      QueryPerformanceCounter(&q);
+      ft_q0 = q.QuadPart;
+      ft_c0 = (LONGLONG)__builtin_ia32_rdtsc();
+    }
+  }
+  lstrcpynA(spec, ft_spec, sizeof spec);
+  for (tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+    unsigned char *fn;
+    int k, dup = 0;
+    if (strncmp(tok, prefix, pl) || tok[pl] != ':')
+      continue;
+    fn = mod ? (unsigned char *)GetProcAddress(mod, tok + pl + 1) : (unsigned char *)strtoul(tok + pl + 1, NULL, 16);
+    if (!fn) {
+      logf("functime: %s not found", tok);
+      continue;
+    }
+    for (k = 0; k < ft_n; k++)
+      if (ft_fns[k].fn == fn)
+        dup = 1;
+    if (!dup)
+      ft_hook(fn, tok, logf);
+  }
+}
+
+static void ft_report(void (*logf)(const char *fmt, ...)) {
+  LARGE_INTEGER q, f;
+  const LONGLONG c = (LONGLONG)__builtin_ia32_rdtsc();
+  double cyc_per_ms, secs;
+  int i;
+  if (!ft_n)
+    return;
+  QueryPerformanceCounter(&q);
+  QueryPerformanceFrequency(&f);
+  secs = (double)(q.QuadPart - ft_q0) / (double)f.QuadPart;
+  cyc_per_ms = (double)(c - ft_c0) / (secs * 1000.0);
+  ft_q0 = q.QuadPart;
+  ft_c0 = c;
+  for (i = 0; i < ft_n; i++) {
+    const LONG n0 = InterlockedExchange(&ft_fns[i].n[0], 0), n1 = InterlockedExchange(&ft_fns[i].n[1], 0);
+    const LONGLONG c0 = InterlockedExchange64(&ft_fns[i].cyc[0], 0), c1 = InterlockedExchange64(&ft_fns[i].cyc[1], 0);
+    if (n0 || n1)
+      logf("  fn %-44.44s render %8.0f/s %6.1f ms/s (%.2f us)  other %8.0f/s %6.1f ms/s", ft_fns[i].name, n0 / secs,
+           c0 / cyc_per_ms / secs, n0 ? c0 / cyc_per_ms * 1000.0 / n0 : 0.0, n1 / secs, c1 / cyc_per_ms / secs);
+  }
+}

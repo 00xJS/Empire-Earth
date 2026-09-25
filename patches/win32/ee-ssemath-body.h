@@ -256,3 +256,111 @@ SSEM_FN static void SSEM(smooth)(const char *model, const char *mat, char *out, 
     }
   }
 }
+
+/* ?GetMeshZ@GETerrainMesh@@QBEMMM@Z (rva 0x3b6ac): the terrain height at x,y,
+ * interpolated over the grid triangle the point falls in.  Floor as the VC6
+ * code does it: fistp, then one less if the unsigned 32-bit value is above the
+ * float (a negative coordinate stays off the map, as in the original).  Rows
+ * of 12 bytes {first column, -, float heights, 3 per column} hang off
+ * this[0x17b578].  gx and the three products stored on the way are floats;
+ * the result is returned unrounded, like the x87's st(0). */
+SSEM_FN static T SSEM_THIS SSEM(meshz)(const char *mesh, float x, float y) {
+  int ix = ssem_fistp(x), iy = ssem_fistp(y);
+  const char *r0;
+  const float *d0, *d1;
+  int c0, c1;
+  if ((double)(unsigned)ix > x)
+    ix--;
+  if ((double)(unsigned)iy > y)
+    iy--;
+  r0 = *(const char *const *)(mesh + 0x17b578) + iy * 12;
+  d0 = *(const float *const *)(r0 + 8);
+  d1 = *(const float *const *)(r0 + 0x14);
+  c0 = ix - *(const int *)r0;
+  c1 = ix - *(const int *)(r0 + 0xc);
+  {
+    const T fx = (T)((double)x - (double)(unsigned)ix), fy = (T)((double)y - (double)(unsigned)iy);
+    const float gx = (float)((T)1 - fx);
+    const T p = (T)d0[c0 * 3] * gx, q = (T)d1[c1 * 3 + 3] * fx, s = q + p;
+    const float tc = (float)p, ys = (float)q, t4 = (float)s, t8 = d0[c0 * 3 + 3];
+    if (fy >= fx) {
+      const T u = (fy - fx) / gx;
+      return ((T)d1[c1 * 3] * gx + ys) * u + ((T)1 - u) * t4;
+    } else {
+      const T v = fy / fx;
+      return ((T)t8 * fx + tc) * ((T)1 - v) + v * t4;
+    }
+  }
+}
+
+/* ?UMArcCos@@YAMM@Z (rva 0x7dcc4): acos from a 32768-entry table below 0.9995,
+ * above that atan(z), z = sqrt(1 - x*x)/x, by its series to z^7 (w = z*z, the
+ * series' first difference and w stored as floats on the way); 0 from 1 up,
+ * pi/2 at 0, and pi - acos(-x) below 0 with x clamped at -1 (NaN too).  The
+ * square root is the DLL's own import (msvcrt), called as the x87 code calls
+ * it.  Returns unrounded, like the x87's st(0). */
+SSEM_FN static T SSEM(umacos)(float x) {
+  if (x > 0) {
+    if (x < g_ssem.ac_lim)
+      return g_ssem.ac_table[ssem_fistp((float)((T)x * g_ssem.ac_scale))];
+    if (x < 1.0f) {
+      const T d = (T)1 - (T)x * x;
+      const double s = g_ssem.crt_sqrt((double)d);
+      const T z = (T)(s / x);
+      const float w = (float)(z * z), zf = (float)z;
+      const T zw = z * w;
+      const float A = (float)((T)zf - (T)g_ssem.ac_c3 * zw);
+      const T zww = zw * w;
+      return ((T)g_ssem.ac_c4 * zww + A) - ((T)w * zww) * g_ssem.ac_c5;
+    }
+    return 0;
+  }
+  if (x >= 0)
+    return g_ssem.half_pi;
+  if (!(x >= g_ssem.ac_clamp))
+    x = g_ssem.ac_clamp;
+  return (T)g_ssem.ac_pi - SSEM(umacos)(-x);
+}
+
+/* ?UMArcTan2@@YAMMM@Z (rva 0x7debb): atan2(a, b) as +-UMArcCos(b / |(a,b)|),
+ * negative when a < 0 (or NaN); b zero or NaN gives +-pi/2 by a's sign. */
+SSEM_FN static T SSEM(umatan2)(float a, float b) {
+  if (b == 0 || b != b)
+    return a >= 0 ? g_ssem.half_pi : g_ssem.ac_nhalf_pi;
+  {
+    const T r2 = (T)a * a + (T)b * b;
+    const double s = g_ssem.crt_sqrt((double)r2);
+    const float c = (float)(T)(b / s);
+    const T r = SSEM(umacos)(c);
+    return (a < 0 || a != a) ? -r : r;
+  }
+}
+
+/* ?Intersects@GE3DLine@@QBE_NABVGE3DPoint@@MAAM@Z (rva 0x2568d): the line
+ * (origin L, direction L+3) against a sphere (centre P, radius r): the
+ * quadratic's terms as the x87 code forms them (v = L - P, a = |dir|^2 and b
+ * stored as floats; c from the expanded squares, as written; the
+ * discriminant stored as a float).  No root: false.  One: t = -b/2a.  Two: t
+ * is the one of smaller magnitude (the first unless the second is smaller). */
+SSEM_FN static int SSEM_THIS SSEM(line_sphere)(const float *L, const float *P, float r, float *t) {
+  const float vx = (float)((T)L[0] - P[0]), vy = (float)((T)L[1] - P[1]), vz = (float)((T)L[2] - P[2]);
+  const float a = (float)(((T)L[3] * L[3] + (T)L[4] * L[4]) + (T)L[5] * L[5]);
+  const float b = (float)((((T)L[5] * vz + (T)L[4] * vy) + (T)L[3] * vx) * 2);
+  const T s5 = (((((T)L[0] * L[0] + (T)P[0] * P[0]) + (T)L[1] * L[1]) + (T)L[2] * L[2]) + (T)P[1] * P[1]) + (T)P[2] * P[2];
+  const T d3 = ((T)P[0] * L[0] + (T)P[1] * L[1]) + (T)P[2] * L[2];
+  const T c = (s5 - d3 * 2) - (T)r * r;
+  const float disc = (float)((T)b * b - (c * a) * 4);
+  if (!(disc >= 0))
+    return 0;
+  if (disc > 0) {
+    const T s = (T)g_ssem.crt_sqrt((double)disc), k = (T)1 / ((T)a + a);
+    const float t1 = (float)((s - b) * k);
+    const T t2 = (-(T)b - s) * k;
+    const float a1 = t1 >= 0 ? t1 : -t1;
+    const T a2 = t2 >= 0 ? t2 : -t2;
+    *t = a1 >= a2 ? (float)t2 : t1;
+    return 1;
+  }
+  *t = (float)-((T)b / ((T)a + a));
+  return 1;
+}
