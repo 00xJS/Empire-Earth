@@ -548,11 +548,14 @@ static HMODULE WINAPI hook_LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags)
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hook_SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f);
+static void __attribute__((thiscall)) hook_BuildPointList(void *self, void *vec, long step);
+#define PL_EXPORT_NAME "?BuildPointList@U2DSparseArrayPointContainer@@QAEXAAV?$vector@V?$U2DPoint@J@@V?$allocator@V?$U2DPoint@J@@@std@@@std@@J@Z"
 
 static void patch_exe_modes(HMODULE mod) {
   if (!mod)
     return;
   patch_iat(mod, "kernel32.dll", "SetUnhandledExceptionFilter", (void *)hook_SetUnhandledExceptionFilter);
+  patch_iat(mod, "low-level engine.dll", PL_EXPORT_NAME, (void *)hook_BuildPointList);
   patch_iat(mod, "user32.dll", "CreateWindowExA", (void *)hook_CreateWindowExA);
   patch_iat(mod, "user32.dll", "EnumDisplaySettingsA", (void *)hook_EnumDisplaySettingsA);
   patch_iat(mod, "user32.dll", "EnumDisplaySettingsExA", (void *)hook_EnumDisplaySettingsExA);
@@ -808,6 +811,101 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hook_SetUnhandledExceptionFilter(LPTO
   if (f != ee_last_chance)
     g_game_filter = f;
   return prev;
+}
+
+/* ---- runaway BuildPointList guard -------------------------------------------
+ * 24 Sep 2026: late in a big match the game's committed memory jumped from 1.2
+ * to 3.8 GB in under a minute and it crashed writing through a NULL from the
+ * heap, inside Low-Level Engine's U2DSparseArrayPointContainer::BuildPointList,
+ * called from Empire Earth.exe.  That routine walks each grid row's list of
+ * [min, max] segments and appends a point for every y in each one (every call
+ * site passes step 1), so a corrupt segment -- a wild max, or a list that loops
+ * back on itself -- makes it append until the address space is gone.  (The
+ * owner's earlier crash, a NULL deque block at exe+0x51828, is the same
+ * exhaustion seen from another thread.)  Before each call from the game, walk
+ * the rows with hard limits; if they fail, log them and return an empty list.
+ * EE_POINTLIST_GUARD=0 turns it off. */
+typedef void(__attribute__((thiscall)) * BuildPointListFn)(void *self, void *vec, long step);
+static BuildPointListFn orig_BuildPointList;
+static volatile LONG g_pl_calls, g_pl_rejects;
+
+static int pl_ptr(const void *p) {
+  uintptr_t v = (uintptr_t)p;
+  return v >= 0x10000 && v < 0xfffe0000u && !(v & 3);
+}
+
+/* The container (this): row table begin/end at +8/+0xc (a VC6 vector), point
+ * count at +0x18.  A row header's first dword is its segment list; a segment
+ * is {min, max, ?, next}.  Returns why the rows look corrupt, or NULL. */
+static const char *pl_bad(const char *self, long *count, unsigned long long *total, long *row, int *mn, int *mx) {
+  char **rb = *(char ***)(self + 8), **re = *(char ***)(self + 0xc), **r;
+  unsigned long nseg = 0;
+  unsigned long long cap;
+  *count = *(const long *)(self + 0x18);
+  *total = 0;
+  *row = -1;
+  *mn = *mx = 0;
+  if (!rb || !re)
+    return NULL;
+  if (!pl_ptr(rb) || re < rb || re - rb > (1 << 20))
+    return "row table";
+  cap = (unsigned long long)(*count > 0 ? *count : 0) * 4 + 1000000;
+  for (r = rb; r < re; r++) {
+    char *seg;
+    if (!*r)
+      continue;
+    *row = (long)(r - rb);
+    if (!pl_ptr(*r))
+      return "row header pointer";
+    for (seg = *(char **)*r; seg; seg = *(char **)(seg + 0xc)) {
+      if (!pl_ptr(seg))
+        return "segment pointer";
+      if (++nseg > 2000000)
+        return "a segment list that never ends";
+      *mn = *(const int *)seg;
+      *mx = *(const int *)(seg + 4);
+      if (*mx < *mn)
+        continue;
+      if ((long long)*mx - *mn >= (1 << 20))
+        return "a segment spanning over a million points";
+      *total += (unsigned long long)(*mx - *mn) + 1;
+      if (*total > cap)
+        return "far more points than the grid holds";
+    }
+  }
+  return NULL;
+}
+
+static void __attribute__((thiscall)) hook_BuildPointList(void *self, void *vec, long step) {
+  static int want = -1;
+  if (want < 0) {
+    char b[8];
+    want = !(GetEnvironmentVariableA("EE_POINTLIST_GUARD", b, sizeof b) > 0 && b[0] == '0');
+  }
+  if (!orig_BuildPointList) {
+    HMODULE eng = GetModuleHandleA("Low-Level Engine.dll");
+    orig_BuildPointList = eng ? (BuildPointListFn)(void *)GetProcAddress(eng, PL_EXPORT_NAME) : NULL;
+    if (!orig_BuildPointList)
+      return;
+  }
+  if (InterlockedIncrement(&g_pl_calls) == 1)
+    ee_log("BuildPointList guard active (first call from the game)");
+  if (want && self && vec) {
+    long count, row;
+    int mn, mx;
+    unsigned long long total;
+    const char *why = pl_bad((const char *)self, &count, &total, &row, &mn, &mx);
+    if (why) {
+      LONG n = InterlockedIncrement(&g_pl_rejects);
+      if (n <= 20)
+        ee_log("!!! BuildPointList(%p): %s (row %ld, segment [%d, %d], %llu points walked, grid count %ld, step %ld) "
+               "-- returned an empty list instead of filling memory (#%ld)",
+               self, why, row, mn, mx, total, count, step, (long)n);
+      *(void **)((char *)vec + 8) = *(void **)((char *)vec + 4); /* VC6 vector: _Last = _First */
+      return;
+    }
+  }
+  orig_BuildPointList(self, vec, step);
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {

@@ -225,13 +225,17 @@ the same value. It plays in matches; the menus have none.
   `patches/wine/patch-wow64cpu.py`, which the installer applies. About one start
   in ten still stalls on the opening banner (the game's own thread stuck in
   Wine's `DestroyWindow` on a 16×16 test window); the retry covers it.
-- **A rare crash in the game's own code.** Once so far (a late-game match, 23 Sep
-  2026) the game died writing through a null pointer inside a `std::deque` push
-  in `Empire Earth.exe` (`+0x51828`), after the heap handed back no block —
-  possibly two game threads using the same queue at once. Address space was
-  not the cause: the game had 2.9 GB of its 4 GB free. The version.dll proxy
-  now writes any crash's registers and stack to `ee-version.log`
-  (`!!! unhandled exception`), so the next one can be traced to its caller.
+- **A rare crash late in big matches.** Twice (23–24 Sep 2026) the game's memory
+  jumped from about 1.2 GB to 3.8 GB within a minute and it crashed writing
+  through a null pointer once the heap was empty. The crash logger traced the
+  runaway to the engine's `U2DSparseArrayPointContainer::BuildPointList`, which
+  lists every point in a patch of the map grid: its row lists had turned
+  corrupt — very likely two game threads updating a grid at once (the engine's
+  grid code takes no lock) — so it kept appending until the address space was
+  gone. The version.dll proxy now checks the grid before each of the game's
+  calls and hands back an empty list if it is corrupt (`EE_POINTLIST_GUARD=0`
+  turns that off), and writes any crash's registers and stack to
+  `ee-version.log` (`!!! unhandled exception`).
 - Multiplayer patches such as NeoEE are optional and not bundled here.
 
 ## Graphics stacks
@@ -269,6 +273,7 @@ committed here.
 | `EE_DDRAW_KEEP_TOPMOST=1` | keep Wine's "always on top" style on the game window |
 | `EE_DDRAW_AUTO_RESTORE=0` | do not restore surfaces when a `Flip` reports them lost |
 | `EE_DDRAW_WNDTRACE=0` | stop logging the game window's focus and size messages |
+| `EE_POINTLIST_GUARD=0` | stop checking the engine's map grids before `BuildPointList` (a corrupt grid then fills memory and crashes the game) |
 | `EE_DDRAW_SYNC_ACTIVATEAPP=1` | deliver "focus lost" to the game at once again (can freeze it when you switch apps) |
 | `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
 | `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
