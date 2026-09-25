@@ -177,6 +177,11 @@ frame with 150+ units on screen, so the launcher used to turn it off. On SSE2 it
 costs 4 ns, and the launcher now turns it on (`EE_ANIMATION_SMOOTHING=0` for the
 last few FPS).
 
+**Art of Conquest** does not get these yet. Its launch does not load the
+`version.dll` proxy that carries them, so it keeps Animation Smoothing off, as
+before. (Its own engine and renderer DLLs are checked too: 17 of the 26 engine
+functions and both smoothing loops are the same code there, and would go in.)
+
 **The simulation keeps the same speed however busy the map is.** It runs on
 its own thread, and the game's synchronous server (built for multiplayer, used
 in single player too) sets how many physics steps it takes per second:
@@ -335,6 +340,7 @@ committed here.
 | `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
 | `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
 | `EE_ANIMATION_SMOOTHING=0` | turn the game's Animation Smoothing off: units step between animation poses; about 9% more FPS in big battles |
+| `EE_AOC_ANIMATION_SMOOTHING=1` | turn Animation Smoothing on in Art of Conquest (off by default there: without the SSE2 blend it is slow in big battles) |
 | `EE_SSE_MATH=0` | run the engine's and renderer's original x87 code instead of the SSE2 rewrites (much slower in big battles) |
 | `EE_RENDER_SLEEP=1` | keep the render loop's 1 ms sleep after every frame (it now only yields the CPU) |
 | `EE_DDRAW_MATCH_GETDC=0` | only a `Lock` of the back buffer marks a match frame again, not `GetDC` (every match frame then pays the full page exchange) |

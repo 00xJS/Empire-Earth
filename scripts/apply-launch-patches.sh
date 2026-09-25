@@ -697,8 +697,11 @@ reg "HKCU\\Software\\SSSI\\Empire Earth" "UseCandidateWindow" "REG_DWORD" "0"
 # and the big-battle benchmark is as fast with it as without.  The game has no
 # menu option for it (registry only; it rewrites the value on exit, so set it
 # on every launch).  EE_ANIMATION_SMOOTHING=0 turns it off.
+# Art of Conquest does not load ee-version (the shim goes into the base game's
+# folder only), so it would run the old x87 blend: off there, as before,
+# unless EE_AOC_ANIMATION_SMOOTHING=1.
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-1}"
-reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-1}"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_AOC_ANIMATION_SMOOTHING:-0}"
 # Art of Conquest keeps its own copy of every display setting.  Left at its
 # defaults (16-bit colour and textures, 800x600) it drew one frame and then hung
 # in Wine's OpenGL ddraw path on a black screen (23 Sep 2026).
