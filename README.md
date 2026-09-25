@@ -223,6 +223,13 @@ the same value. It plays in matches; the menus have none.
   `patches/wine/patch-wow64cpu.py`, which the installer applies. About one start
   in ten still stalls on the opening banner (the game's own thread stuck in
   Wine's `DestroyWindow` on a 16×16 test window); the retry covers it.
+- **A rare crash in the game's own code.** Once so far (a late-game match, 23 Sep
+  2026) the game died writing through a null pointer inside a `std::deque` push
+  in `Empire Earth.exe` (`+0x51828`), after the heap handed back no block —
+  possibly two game threads using the same queue at once. Address space was
+  not the cause: the game had 2.9 GB of its 4 GB free. The version.dll proxy
+  now writes any crash's registers and stack to `ee-version.log`
+  (`!!! unhandled exception`), so the next one can be traced to its caller.
 - Multiplayer patches such as NeoEE are optional and not bundled here.
 
 ## Graphics stacks

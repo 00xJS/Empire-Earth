@@ -547,9 +547,12 @@ static HMODULE WINAPI hook_LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags)
   return mod;
 }
 
+static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hook_SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f);
+
 static void patch_exe_modes(HMODULE mod) {
   if (!mod)
     return;
+  patch_iat(mod, "kernel32.dll", "SetUnhandledExceptionFilter", (void *)hook_SetUnhandledExceptionFilter);
   patch_iat(mod, "user32.dll", "CreateWindowExA", (void *)hook_CreateWindowExA);
   patch_iat(mod, "user32.dll", "EnumDisplaySettingsA", (void *)hook_EnumDisplaySettingsA);
   patch_iat(mod, "user32.dll", "EnumDisplaySettingsExA", (void *)hook_EnumDisplaySettingsExA);
@@ -770,6 +773,43 @@ static LONG CALLBACK ee_veh(EXCEPTION_POINTERS *ep) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* ---- last-chance crash log ---------------------------------------------------
+ * A crash in the game's own code (23 Sep 2026: a write to 0xFFC inside a
+ * std::deque push, Empire Earth.exe+0x51828, thread 0434) left one line in the
+ * launch log: Wine's debugger cannot attach under WoW64/Rosetta.  The VEH above
+ * is opt-in because it runs on every first-chance exception; a top-level
+ * filter only runs when the process is about to die, so it is always on.  The
+ * game's CRT installs its own filter, so SetUnhandledExceptionFilter in the exe
+ * is hooked: ours stays in front and hands on to the game's. */
+static LPTOP_LEVEL_EXCEPTION_FILTER g_game_filter;
+
+static LONG WINAPI ee_last_chance(EXCEPTION_POINTERS *ep) {
+  static LONG once;
+  if (ep && ep->ExceptionRecord && !InterlockedExchange(&once, 1)) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    ee_log("!!! unhandled exception 0x%08lx at %p in thread %04lx", (unsigned long)er->ExceptionCode,
+           er->ExceptionAddress, (unsigned long)GetCurrentThreadId());
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+      ee_log("    %s address %p", er->ExceptionInformation[0] ? "write to" : "read from",
+             (void *)er->ExceptionInformation[1]);
+    describe_addr("fault pc", er->ExceptionAddress);
+    if (ep->ContextRecord) {
+      log_ctx_stack(ep->ContextRecord);
+      ee_log("  raw stack scan:");
+      scan_stack(ep->ContextRecord->Esp);
+    }
+    fflush(NULL);
+  }
+  return g_game_filter ? g_game_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hook_SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f) {
+  LPTOP_LEVEL_EXCEPTION_FILTER prev = g_game_filter;
+  if (f != ee_last_chance)
+    g_game_filter = f;
+  return prev;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
@@ -787,6 +827,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
       if (GetEnvironmentVariableA("EE_VEH", b, sizeof b) > 0 && b[0] == '1')
         AddVectoredExceptionHandler(1, ee_veh);
     }
+    SetUnhandledExceptionFilter(ee_last_chance);
     install_raise_detour();
     load_real();
   }
