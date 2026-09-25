@@ -96,3 +96,43 @@ SSEM_FN static float SSEM(umcos)(float a) {
     return g_ssem.cos_table[ssem_fistp(t)];
   }
 }
+
+/* ?ComputeDimensions@GEBoundingBox@@AAEXXZ  (rva 0x26a90): order each axis's
+ * min/max (swap unless max >= min), then the extents x at +0x18, z at +0x1c,
+ * y at +0x20.  The swap moves raw bits, as flds/fstps do for real numbers. */
+SSEM_FN static void SSEM_THIS SSEM(bbox_dims)(float *b) {
+  int k;
+  for (k = 0; k < 3; k++)
+    if (!(b[3 + k] >= b[k])) {
+      unsigned t, u;
+      memcpy(&t, &b[k], 4);
+      memcpy(&u, &b[3 + k], 4);
+      memcpy(&b[k], &u, 4);
+      memcpy(&b[3 + k], &t, 4);
+    }
+  b[6] = (float)((T)b[3] - b[0]);
+  b[7] = (float)((T)b[5] - b[2]);
+  b[8] = (float)((T)b[4] - b[1]);
+}
+
+/* ?SetOrientationYPR@GETransformation@@QAEXMMM@Z  (rva 0x472d3): the 3x3
+ * rotation from yaw a, pitch b, roll c with UMCos (sin x = UMCos(pi/2 - x),
+ * the argument rounded to float), leaving the translation and row 3 alone.
+ * p = (-sb)(-sa) stays unrounded on the x87 stack; t1 = (-sb)ca is stored. */
+SSEM_FN static void SSEM_THIS SSEM(ypr)(float *m, float a, float b, float c) {
+  const T K = g_ssem.half_pi;
+  const float ca = SSEM(umcos)(a), sa = SSEM(umcos)((float)(K - a)), nsa = -sa;
+  const float cb = SSEM(umcos)(b), sb = SSEM(umcos)((float)(K - b)), nsb = -sb;
+  const float cc = SSEM(umcos)(c), sc = SSEM(umcos)((float)(K - c)), nsc = -sc;
+  const T p = (T)nsb * nsa;
+  const float t1 = (float)((T)nsb * ca);
+  memcpy(&m[9], &sb, 4); /* an integer move in the original */
+  m[0] = (float)(p * sc + (T)cc * ca);
+  m[1] = (float)((T)cb * nsa);
+  m[2] = (float)(p * cc + (T)nsc * ca);
+  m[4] = (float)((T)t1 * sc + (T)cc * sa);
+  m[5] = (float)((T)cb * ca);
+  m[6] = (float)((T)t1 * cc + (T)nsc * sa);
+  m[8] = (float)((T)sc * cb);
+  m[10] = (float)((T)cc * cb);
+}

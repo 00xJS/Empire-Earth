@@ -21,7 +21,7 @@
 #define SSEM_THIS __attribute__((thiscall))
 
 static struct {
-  float cos_lo, cos_step, cos_hi, cos_scale;
+  float cos_lo, cos_step, cos_hi, cos_scale, half_pi;
   const float *cos_table;
 } g_ssem;
 
@@ -83,6 +83,32 @@ static int SSEM_THIS ssem_below(const float *pl, const float *pt) {
   return SSEM_PC24() ? ssem_below_f(pl, pt) : ssem_below_d(pl, pt);
 }
 static float ssem_umcos(float a) { return SSEM_PC24() ? ssem_umcos_f(a) : ssem_umcos_d(a); }
+static void SSEM_THIS ssem_bbox_dims(float *b) {
+  if (SSEM_PC24()) ssem_bbox_dims_f(b); else ssem_bbox_dims_d(b);
+}
+static void SSEM_THIS ssem_ypr(float *m, float a, float b, float c) {
+  if (SSEM_PC24()) ssem_ypr_f(m, a, b, c); else ssem_ypr_d(m, a, b, c);
+}
+/* ??0GE3DPlane@@QAE@XZ (rva 0x32c9): point 0,0,0, normal 0,0,1; returns this. */
+static void *SSEM_THIS ssem_plane_ctor(float *p) {
+  static const float v[6] = {0, 0, 0, 0, 0, 1};
+  memcpy(p, v, sizeof v);
+  return p;
+}
+/* ??0GE3DLine@@QAE@XZ (rva 0x1e46): 0,0,0 then 1,0,0; returns this. */
+static void *SSEM_THIS ssem_line_ctor(float *p) {
+  static const float v[6] = {0, 0, 0, 1, 0, 0};
+  memcpy(p, v, sizeof v);
+  return p;
+}
+/* ??0GEBoundingBox@@QAE@XZ (rva 0x3990): min 0,0,0, max 1,1,1, then
+ * ComputeDimensions; returns this. */
+static void *SSEM_THIS ssem_bbox_ctor(float *b) {
+  static const float v[6] = {0, 0, 0, 1, 1, 1};
+  memcpy(b, v, sizeof v);
+  ssem_bbox_dims(b);
+  return b;
+}
 
 /* ??0GETransformation@@QAE@XZ  (rva 0x466c8): identity; returns this. */
 static void *SSEM_THIS ssem_ctor(float *m) {
@@ -109,6 +135,11 @@ static const struct ssem_patch g_ssem_patches[] = {
     SSEM_P("?IsPointOnOrBelowPlane@GE3DPlane@@QBE_NABVGE3DPoint@@@Z", 71, 0xf05d30e3, below),
     SSEM_P("?UMCos@@YAMM@Z", 101, 0xeb6ec416, umcos),
     {"??0GETransformation@@QAE@XZ", 82, 0x1a835b38, (void *)ssem_ctor},
+    {"??0GE3DPlane@@QAE@XZ", 37, 0xe15509de, (void *)ssem_plane_ctor},
+    {"??0GE3DLine@@QAE@XZ", 32, 0x445ed7ea, (void *)ssem_line_ctor},
+    {"??0GEBoundingBox@@QAE@XZ", 41, 0x895a38a8, (void *)ssem_bbox_ctor},
+    SSEM_P("?ComputeDimensions@GEBoundingBox@@AAEXXZ", 105, 0x46cedc3a, bbox_dims),
+    SSEM_P("?SetOrientationYPR@GETransformation@@QAEXMMM@Z", 244, 0x57ef8956, ypr),
 };
 #define SSEM_N ((int)(sizeof g_ssem_patches / sizeof g_ssem_patches[0]))
 
@@ -127,6 +158,7 @@ static void ssem_bind(HMODULE lle) {
   g_ssem.cos_hi = *(const float *)(b + 0x9653c);
   g_ssem.cos_scale = *(const float *)(b + 0x96744);
   g_ssem.cos_table = (const float *)(b + 0xd9130);
+  g_ssem.half_pi = *(const float *)(b + 0x94818);
 }
 
 /* FNV-1a of a function's bytes with every base-relocated dword zeroed, so the

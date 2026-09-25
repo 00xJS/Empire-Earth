@@ -960,8 +960,34 @@ static DWORD ls_next;
 
 static LONG ls_us(LARGE_INTEGER a, LARGE_INTEGER b) { return (LONG)((b.QuadPart - a.QuadPart) * 1000000 / ls_freq.QuadPart); }
 
+/* Writes per thread since the last stats line: the busiest writer is the
+ * simulation (the loader thread writes a few times while a game loads). */
+static struct { DWORD tid; LONG n; } ls_wr[8];
+static void ls_count_writer(void) {
+  DWORD t = GetCurrentThreadId();
+  int i;
+  for (i = 0; i < 8; i++) {
+    if (ls_wr[i].tid == t || !ls_wr[i].tid) {
+      ls_wr[i].tid = t;
+      ls_wr[i].n++;
+      return;
+    }
+  }
+}
+static DWORD ls_top_writer(void) {
+  int i, best = 0;
+  DWORD t;
+  for (i = 1; i < 8; i++)
+    if (ls_wr[i].n > ls_wr[best].n)
+      best = i;
+  t = ls_wr[best].tid;
+  memset(ls_wr, 0, sizeof ls_wr);
+  return t;
+}
+
 static void __attribute__((thiscall)) ls_wlock(void *self) {
   tr_wlock(self);
+  ls_count_writer(); /* under the lock: one writer at a time */
   QueryPerformanceCounter(&ls_t_acq); /* one writer at a time: the lock guarantees it */
   InterlockedIncrement(&ls_writes);
 }
@@ -979,8 +1005,9 @@ static void __attribute__((thiscall)) ls_wunlock(void *self) {
     LONG w = InterlockedExchange(&ls_writes, 0), h = InterlockedExchange(&ls_hold_us, 0), m = InterlockedExchange(&ls_hold_max, 0);
     LONG r = InterlockedExchange(&ls_reads, 0), rw = InterlockedExchange(&ls_rwait_us, 0);
     if (ls_next)
-      ee_log("world lock: %.1f writes/s held %.2f ms each (max %.1f); %.1f reads/s waited %.2f ms each",
-             w / 10.0, w ? h / 1000.0 / w : 0.0, m / 1000.0, r / 10.0, r ? rw / 1000.0 / r : 0.0);
+      ee_log("world lock: %.1f writes/s held %.2f ms each (max %.1f); %.1f reads/s waited %.2f ms each; writer %04lx",
+             w / 10.0, w ? h / 1000.0 / w : 0.0, m / 1000.0, r / 10.0, r ? rw / 1000.0 / r : 0.0,
+             (unsigned long)ls_top_writer());
     ls_next = now + 10000;
   }
 }
