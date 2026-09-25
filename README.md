@@ -19,7 +19,9 @@ MacBook Pro), with sound effects and music. Early in a match it runs at 105–12
 FPS. A 26-minute random map ran without a single freeze. The Art of Conquest
 expansion reaches its menu and plays random maps the same way. The menu, which
 the game fixes at 1024×768, is scaled to the full screen height with black bars
-at the sides, and the cursor moves over it cleanly.
+at the sides, and the cursor moves over it cleanly. Saved games load, the
+campaigns of both games play (briefings, in-engine cutscenes and missions), and
+the Scenario Editor opens (in its own 800×600 mode).
 
 A Gigantic random map loads in about 16 seconds, and the load carries on while
 you are in another app.
