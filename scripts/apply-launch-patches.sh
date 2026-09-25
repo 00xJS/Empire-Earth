@@ -10,10 +10,10 @@ load_config
 # GRAPHICS_STACK / VIRTUAL_DESKTOP as loaded from disk. EE_GRAPHICS and
 # EE_FORCE_VIRTUAL_DESKTOP are per-run overrides and must never be written back
 # into config.json, or one experiment silently changes the saved default.
-SAVED_GRAPHICS="${GRAPHICS_STACK:-dgvoodoo}"
-SAVED_VD="${VIRTUAL_DESKTOP:-0}"
+SAVED_GRAPHICS="${GRAPHICS_STACK:-d7vk}"
+SAVED_VD="${VIRTUAL_DESKTOP:-1}"
 SAVED_VD_SIZE="${VIRTUAL_DESKTOP_SIZE:-1440x933}"
-SAVED_MUSIC="${MUSIC_ENABLED:-0}"
+SAVED_MUSIC="${MUSIC_ENABLED:-1}"
 
 save_config_preserving_prefs() {
   local r_g="${EE_GRAPHICS:-}" r_v="${VIRTUAL_DESKTOP:-}"
@@ -163,7 +163,7 @@ install_windowed_wrappers() {
   local dest="$1"
   local helpers="$SUPPORT_DIR/patches/win32"
   [[ -d "$dest" ]] || return 0
-  case "${EE_GRAPHICS:-dgvoodoo}" in
+  case "${EE_GRAPHICS:-d7vk}" in
     dgvoodoo-wined3d|dxmt|d3dmetal|d7vk) return 0 ;;
   esac
   if [[ ! -f "$helpers/dxgi.dll" ]]; then
@@ -518,7 +518,7 @@ DXVKCONF
 
 install_graphics() {
   local dest="$1"
-  case "${EE_GRAPHICS:-dgvoodoo}" in
+  case "${EE_GRAPHICS:-d7vk}" in
     gog-d3d9)
       install_gog_d3d9 "$dest"
       ;;
@@ -551,20 +551,20 @@ fi
 reg "HKCU\\Software\\Wine\\DllOverrides" "ddraw" "REG_SZ" "native"
 reg "HKCU\\Software\\Wine\\DllOverrides" "dsound" "REG_SZ" "builtin"
 reg "HKCU\\Software\\Wine\\DllOverrides" "dmusic" "REG_SZ" "native"
-if [[ "${EE_GRAPHICS:-dgvoodoo}" == "gog-d3d9" ]]; then
+if [[ "${EE_GRAPHICS:-d7vk}" == "gog-d3d9" ]]; then
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d9" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "dxgi" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d11" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d10core" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "wined3d" "REG_SZ" "builtin"
-elif [[ "${EE_GRAPHICS:-dgvoodoo}" == "dgvoodoo-wined3d" ]]; then
+elif [[ "${EE_GRAPHICS:-d7vk}" == "dgvoodoo-wined3d" ]]; then
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3dimm" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d11" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "dxgi" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d10core" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d9" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "wined3d" "REG_SZ" "builtin"
-elif [[ "${EE_GRAPHICS:-dgvoodoo}" == "dxmt" ]]; then
+elif [[ "${EE_GRAPHICS:-d7vk}" == "dxmt" ]]; then
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3dimm" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d11" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "dxgi" "REG_SZ" "native"
@@ -572,7 +572,7 @@ elif [[ "${EE_GRAPHICS:-dgvoodoo}" == "dxmt" ]]; then
   reg "HKCU\\Software\\Wine\\DllOverrides" "winemetal" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d9" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "wined3d" "REG_SZ" "builtin"
-elif [[ "${EE_GRAPHICS:-dgvoodoo}" == "d7vk" ]]; then
+elif [[ "${EE_GRAPHICS:-d7vk}" == "d7vk" ]]; then
   # D7VK's ddraw.dll has NO Vulkan symbols -- it is a D3D7->D3D9 layer that
   # imports Direct3DCreate9. The Vulkan backend is DXVK-Sarek's d3d9.dll. If
   # d3d9 is left builtin, D7VK lands on Wine's wined3d, Direct3DCreate9 gives it
@@ -583,7 +583,7 @@ elif [[ "${EE_GRAPHICS:-dgvoodoo}" == "d7vk" ]]; then
   reg "HKCU\\Software\\Wine\\DllOverrides" "dxgi" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d10core" "REG_SZ" "builtin"
   reg "HKCU\\Software\\Wine\\DllOverrides" "wined3d" "REG_SZ" "builtin"
-elif [[ "${EE_GRAPHICS:-dgvoodoo}" == "d3dmetal" ]]; then
+elif [[ "${EE_GRAPHICS:-d7vk}" == "d3dmetal" ]]; then
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3dimm" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "d3d11" "REG_SZ" "native"
   reg "HKCU\\Software\\Wine\\DllOverrides" "dxgi" "REG_SZ" "native"

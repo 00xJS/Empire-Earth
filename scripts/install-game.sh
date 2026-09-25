@@ -39,6 +39,8 @@ if [[ $status -ne 0 ]]; then
 fi
 
 search_root="$PREFIX/drive_c"
+# Keep the saved settings (music, graphics stack...); only the game paths change.
+load_config
 if ! discover_game "$search_root"; then
   die "Install finished but Empire Earth.exe was not found in the Wine prefix."
 fi

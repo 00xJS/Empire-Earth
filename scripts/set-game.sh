@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Remember a local GOG folder or Empire Earth.exe / EE-AOC.exe.
+# Remember a local GOG folder or Empire Earth.exe / EE-AOC.exe (a GOG setup_*.exe
+# is handed to install-game.sh, which installs it into the prefix first).
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,7 +13,7 @@ path="${1:-}"
 load_config
 
 if looks_like_installer "$path"; then
-  die "That file looks like a setup.exe. Use Install from GOG setup instead of Choose folder."
+  exec "$SCRIPT_DIR/install-game.sh" "$path"
 fi
 
 if ! discover_game "$path"; then

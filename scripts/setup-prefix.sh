@@ -20,6 +20,14 @@ if ! command -v winetricks >/dev/null 2>&1; then
 fi
 winetricks_bin="$(find_winetricks || true)"
 [[ -n "$winetricks_bin" ]] || die "winetricks is not installed"
+# MinGW builds the ee-ddraw / ee-version proxies that carry the game's fixes
+# (page flips, the focus-switch freeze, the late-game crash guard).
+if ! command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then
+  command -v brew >/dev/null 2>&1 ||
+    die "Homebrew is required to install MinGW (free). Install Homebrew from https://brew.sh then try again."
+  log "Installing MinGW via Homebrew (builds the game's fix-up DLLs)"
+  brew install mingw-w64
+fi
 
 if [[ -f "$READY_STAMP" ]] && directmusic_present; then
   log "Prefix already ready at $PREFIX"

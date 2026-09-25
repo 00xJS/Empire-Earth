@@ -18,7 +18,7 @@ load_config
 # for mscoree/mshtml and every other override in it was ignored.  All it ever
 # did -- and all it needs to do -- is keep Wine's .NET and HTML engines off.
 export WINEDLLOVERRIDES="mscoree,mshtml="
-case "${EE_GRAPHICS:-dgvoodoo}" in
+case "${EE_GRAPHICS:-d7vk}" in
   dxmt)
     export EMPIRE_EARTH_WINE="${EMPIRE_EARTH_WINE:-$HOME/Library/Application Support/EmpireEarthMac/runtime/Wine Devel.app/Contents/Resources/wine/bin/wine}"
     ;;

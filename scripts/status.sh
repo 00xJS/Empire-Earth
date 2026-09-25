@@ -20,8 +20,8 @@ fi
 
 python3 - "$wine_path" "$winetricks_path" "$PREFIX" "$prefix_ok" "$dm" \
   "${GAME_DIR:-}" "${BASE_EXE:-}" "${AOC_EXE:-}" \
-  "${MUSIC_ENABLED:-0}" "${VIRTUAL_DESKTOP:-0}" "${VIRTUAL_DESKTOP_SIZE:-1920x1080}" \
-  "${EE_GRAPHICS:-dgvoodoo}" "$CONFIG_FILE" <<'PY'
+  "${MUSIC_ENABLED:-1}" "${VIRTUAL_DESKTOP:-1}" "${VIRTUAL_DESKTOP_SIZE:-1440x933}" \
+  "${EE_GRAPHICS:-d7vk}" "$CONFIG_FILE" <<'PY'
 import json, os, re, sys
 
 def flag(value):
@@ -49,7 +49,7 @@ config_path = sys.argv[13] if len(sys.argv) > 13 else ""
 music_on = game_music(prefix, config_path)
 if music_on is None:
     music_on = flag(music)
-graphics = sys.argv[12] if len(sys.argv) > 12 else "dgvoodoo"
+graphics = sys.argv[12] if len(sys.argv) > 12 else "d7vk"
 errors = []
 warnings = []
 if not wine:
@@ -80,8 +80,8 @@ payload = {
     "aoc_exe": aoc_exe or None,
     "music_enabled": music_on,
     "virtual_desktop": flag(vd),
-    "virtual_desktop_size": vd_size or "1920x1080",
-    "graphics_stack": graphics or "dgvoodoo",
+    "virtual_desktop_size": vd_size or "1440x933",
+    "graphics_stack": graphics or "d7vk",
     "can_play": bool(wine and prefix_ok == "1" and base_exe and os.path.isfile(base_exe)),
     "can_play_aoc": bool(wine and prefix_ok == "1" and aoc_exe and os.path.isfile(aoc_exe) and base_exe and os.path.isfile(base_exe)),
     "errors": errors,

@@ -44,9 +44,13 @@ chmod +x scripts/*.sh
 ./scripts/set-game.sh "/path/to/Empire Earth Gold Edition"
 ```
 
-`setup-prefix.sh` installs DirectMusic, which Empire Earth needs or it crashes at
-startup. If you have the GOG installer rather than an installed folder, point
-`set-game.sh` at the `setup_*.exe` instead and it will install into the bottle.
+`install-wine.sh` downloads Gcenx's free Wine Stable 11.0_1 build (185 MB,
+checksum-checked) and does nothing if it is already installed. That exact build
+matters: it is the one the Rosetta crash fix patches, and the newer Devel 11.17
+cannot create the game's graphics device. `setup-prefix.sh` installs DirectMusic,
+which Empire Earth needs or it crashes at startup. If you have the GOG installer
+rather than an installed folder, point `set-game.sh` at the `setup_*.exe` instead
+and it will install into the bottle.
 
 ## Play
 
@@ -249,7 +253,7 @@ kept because they were useful for bisecting.
 | `dgvoodoo` | dgVoodoo 2.79.3 + DXVK D3D11 (2.82+ crashes inside DDraw on Wine) |
 | `gog-d3d9` | GOG's D3D7 → D3D9 wrapper + DXVK D3D9 |
 | `dgvoodoo-wined3d` | dgVoodoo + Wine's builtin D3D11 |
-| `dxmt` | dgVoodoo + DXMT 0.80 on Wine Devel |
+| `dxmt` | dgVoodoo + DXMT 0.80 on Wine Devel (`EMPIRE_EARTH_WINE_CHANNEL=devel ./scripts/install-wine.sh`) |
 | `d3dmetal` | Apple D3DMetal/GPTK — 64-bit only, so a 32-bit EXE cannot use it |
 
 ```bash

@@ -12,14 +12,25 @@ PREFIX="${EMPIRE_EARTH_WINEPREFIX:-$SUPPORT_DIR/wineprefix}"
 LOG_DIR="$SUPPORT_DIR/logs"
 CONFIG_FILE="$SUPPORT_DIR/config.json"
 RUNTIME_DIR="$SUPPORT_DIR/runtime"
-WINE_APP="$RUNTIME_DIR/Wine Devel.app"
 READY_STAMP="$PREFIX/.ee_mac_ready"
-# Installer still fetches Gcenx devel. Graphics currently work better on Stable 11.0
-# (11.17's winevulkan/MoltenVK fails DXVK device create on this game).
-WINE_VERSION="${EMPIRE_EARTH_WINE_VERSION:-11.17}"
-WINE_TARBALL="wine-devel-${WINE_VERSION}-osx64.tar.xz"
+# install-wine.sh fetches Gcenx's free Wine Stable 11.0_1: the only build that has
+# created a D3D11 device for this game (Devel 11.17's winevulkan/MoltenVK fails DXVK
+# device create), and the exact wow64cpu.dll patches/wine/patch-wow64cpu.py fixes.
+# EMPIRE_EARTH_WINE_CHANNEL=devel fetches Devel 11.17 (only the experimental dxmt stack uses it).
+if [[ "${EMPIRE_EARTH_WINE_CHANNEL:-stable}" == devel ]]; then
+  WINE_CHANNEL=devel
+  WINE_APP="$RUNTIME_DIR/Wine Devel.app"
+  WINE_VERSION="${EMPIRE_EARTH_WINE_VERSION:-11.17}"
+  wine_sha256=c2b3a8274dbc594deaa64e40469b607cbc4aa8ef5656dec4c5f6f3dac0da770c
+else
+  WINE_CHANNEL=stable
+  WINE_APP="$RUNTIME_DIR/Wine Stable.app"
+  WINE_VERSION="${EMPIRE_EARTH_WINE_VERSION:-11.0_1}"
+  wine_sha256=b50dc50ec7f41d58b115a6b685d4d1315ba3c797bd3aa0f49213f2703cb82388
+fi
+WINE_TARBALL="wine-${WINE_CHANNEL}-${WINE_VERSION}-osx64.tar.xz"
 WINE_URL="${EMPIRE_EARTH_WINE_URL:-https://github.com/Gcenx/macOS_Wine_builds/releases/download/${WINE_VERSION}/${WINE_TARBALL}}"
-WINE_SHA256="${EMPIRE_EARTH_WINE_SHA256:-c2b3a8274dbc594deaa64e40469b607cbc4aa8ef5656dec4c5f6f3dac0da770c}"
+WINE_SHA256="${EMPIRE_EARTH_WINE_SHA256:-$wine_sha256}"
 
 mkdir -p "$SUPPORT_DIR" "$LOG_DIR" "$RUNTIME_DIR"
 
@@ -54,7 +65,7 @@ load_config() {
   VIRTUAL_DESKTOP_SIZE="1440x933"
   GRAPHICS_STACK="d7vk"
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    EE_GRAPHICS="${EE_GRAPHICS:-dgvoodoo}"
+    EE_GRAPHICS="${EE_GRAPHICS:-$GRAPHICS_STACK}"
     return 0
   fi
   eval "$(python3 - "$CONFIG_FILE" <<'PY'
@@ -93,9 +104,9 @@ save_config() {
   mkdir -p "$SUPPORT_DIR"
   python3 - "$CONFIG_FILE" \
     "${GAME_DIR:-}" "${BASE_EXE:-}" "${AOC_EXE:-}" \
-    "${MUSIC_ENABLED:-0}" "${VIRTUAL_DESKTOP:-0}" \
+    "${MUSIC_ENABLED:-1}" "${VIRTUAL_DESKTOP:-1}" \
     "${VIRTUAL_DESKTOP_SIZE:-1440x933}" \
-    "${EE_GRAPHICS:-dgvoodoo}" "${FULLSCREEN:-1}" "${GAME_RESOLUTION:-auto}" <<'PY'
+    "${EE_GRAPHICS:-d7vk}" "${FULLSCREEN:-1}" "${GAME_RESOLUTION:-auto}" <<'PY'
 import json, sys
 path = sys.argv[1]
 payload = {
@@ -104,8 +115,8 @@ payload = {
     "aoc_exe": sys.argv[4],
     "music_enabled": sys.argv[5] in {"1", "true", "True", "yes"},
     "virtual_desktop": sys.argv[6] in {"1", "true", "True", "yes"},
-    "virtual_desktop_size": sys.argv[7] or "1920x1080",
-    "graphics_stack": sys.argv[8] or "dgvoodoo",
+    "virtual_desktop_size": sys.argv[7] or "1440x933",
+    "graphics_stack": sys.argv[8] or "d7vk",
     "fullscreen": sys.argv[9] in {"1", "true", "True", "yes"},
     "game_resolution": sys.argv[10] or "auto",
 }

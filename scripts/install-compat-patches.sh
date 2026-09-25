@@ -200,6 +200,8 @@ install_wow64cpu_rosetta_patch() {
 }
 
 install_dgvoodoo_279
+# D7VK is the default graphics stack; nothing else fetches it on a first run.
+"$SCRIPT_DIR/install-d7vk.sh" >/dev/null
 copy_repo_configs
 install_win32u_extent_patch
 install_wow64cpu_rosetta_patch
@@ -208,7 +210,7 @@ apply_wine_reg
 if command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then
   "$SCRIPT_DIR/build-win32-helpers.sh" || log "Win32 DXGI helper build failed"
 else
-  log "MinGW not installed; skip 800x600 DXGI helper (brew install mingw-w64)"
+  log "WARNING: MinGW not installed, so the ee-ddraw/ee-version fix-up DLLs cannot be built and the game runs without them (brew install mingw-w64)"
 fi
 SRC_DISPLAY="$(cd "$SCRIPT_DIR/.." && pwd)/patches/macos/ee-display-mode.c"
 if [[ -f "$SRC_DISPLAY" ]]; then

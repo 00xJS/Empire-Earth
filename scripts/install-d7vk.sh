@@ -13,7 +13,9 @@ source "$SCRIPT_DIR/lib.sh"
 
 VERSION="1.13.0"
 URL="https://github.com/pythonlover02/dxvk-sarek/releases/download/v${VERSION}/dxvk-sarek-${VERSION}.tar.gz"
+SHA256="${EMPIRE_EARTH_D7VK_SHA256:-b42d8f2edeb5ed53d1e0009e17bcd765f53c1ac0fda6c936a76b70b2c289dcf8}"
 dest="$SUPPORT_DIR/patches/d7vk"
+archive="$dest/dxvk-sarek-${VERSION}.tar.gz"
 payload="$dest/dxvk-sarek-${VERSION}/build/x32/ddraw.dll"
 
 if [[ -f "$payload" ]]; then
@@ -23,10 +25,15 @@ fi
 
 mkdir -p "$dest"
 log "Downloading DXVK-Sarek ${VERSION} (D7VK)"
-if ! curl -fsSL -o "$dest/dxvk-sarek-${VERSION}.tar.gz" "$URL"; then
+if ! curl -fsSL -o "$archive" "$URL"; then
   die "Could not download DXVK-Sarek from $URL"
 fi
-tar xf "$dest/dxvk-sarek-${VERSION}.tar.gz" -C "$dest"
+actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+if [[ "$actual" != "$SHA256" ]]; then
+  rm -f "$archive"
+  die "DXVK-Sarek download checksum mismatch (expected $SHA256, got $actual)"
+fi
+tar xf "$archive" -C "$dest"
 
 [[ -f "$payload" ]] || die "D7VK archive did not contain build/x32/ddraw.dll"
 if ! file "$payload" | grep -q "80386"; then
