@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include "ee-ssemath.h"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -914,6 +915,148 @@ static void __attribute__((thiscall)) hook_BuildPointList(void *self, void *vec,
   orig_BuildPointList(self, vec, step);
 }
 
+/* ---- the render loop's Sleep(1) ------------------------------------------
+ * The game's render thread (a TSThread whose loop is at 0x50fe42) ends every
+ * pass with Sleep(1) -- in 2001 that handed the one CPU to the simulation
+ * thread.  Under Wine on macOS it is a real ~1.2 ms sleep per frame: 10% of
+ * the render thread in a big match (ee-prof, 25 Sep 2026), while the
+ * simulation thread sat idle 72% of the time on its own.  In front, the pass
+ * now only yields; in the background it keeps the 1 ms sleep, so a paused
+ * game does not spin a core.  The world lock the two threads share hands its
+ * auto-reset event to whichever waits (TSReadWriteLock), so a waiting
+ * simulation still gets its turn.  EE_RENDER_SLEEP=1 restores the original. */
+static void ee_render_sleep(void) {
+  static DWORD next, pid;
+  static int front = 1;
+  DWORD now = GetTickCount();
+  if ((LONG)(now - next) >= 0) {
+    HWND fg = GetForegroundWindow();
+    DWORD fp = 0;
+    if (!pid)
+      pid = GetCurrentProcessId();
+    if (fg)
+      GetWindowThreadProcessId(fg, &fp);
+    front = fp == pid;
+    next = now + 100;
+  }
+  if (front)
+    SwitchToThread();
+  else
+    Sleep(1);
+}
+
+/* ---- world-lock statistics (EE_LOCK_STATS=1) -------------------------------
+ * The render thread reads the game world under a TSReadWriteLock that the
+ * simulation thread takes for writing while it updates.  Wrapping the three
+ * lock calls (trampolines over their position-independent first bytes) logs
+ * every 10 s: simulation writes per second (the game's update rate, i.e. how
+ * fast animations advance), how long each write holds the world, and how
+ * long readers waited for it. */
+typedef void(__attribute__((thiscall)) * lockfn)(void *);
+static lockfn tr_wlock, tr_wunlock, tr_rlock;
+static volatile LONG ls_writes, ls_hold_us, ls_hold_max, ls_rwait_us, ls_reads;
+static LARGE_INTEGER ls_freq, ls_t_acq;
+static DWORD ls_next;
+
+static LONG ls_us(LARGE_INTEGER a, LARGE_INTEGER b) { return (LONG)((b.QuadPart - a.QuadPart) * 1000000 / ls_freq.QuadPart); }
+
+static void __attribute__((thiscall)) ls_wlock(void *self) {
+  tr_wlock(self);
+  QueryPerformanceCounter(&ls_t_acq); /* one writer at a time: the lock guarantees it */
+  InterlockedIncrement(&ls_writes);
+}
+static void __attribute__((thiscall)) ls_wunlock(void *self) {
+  LARGE_INTEGER t;
+  LONG held;
+  DWORD now = GetTickCount();
+  QueryPerformanceCounter(&t);
+  held = ls_us(ls_t_acq, t);
+  InterlockedExchangeAdd(&ls_hold_us, held);
+  if (held > ls_hold_max)
+    ls_hold_max = held;
+  tr_wunlock(self);
+  if ((LONG)(now - ls_next) >= 0) {
+    LONG w = InterlockedExchange(&ls_writes, 0), h = InterlockedExchange(&ls_hold_us, 0), m = InterlockedExchange(&ls_hold_max, 0);
+    LONG r = InterlockedExchange(&ls_reads, 0), rw = InterlockedExchange(&ls_rwait_us, 0);
+    if (ls_next)
+      ee_log("world lock: %.1f writes/s held %.2f ms each (max %.1f); %.1f reads/s waited %.2f ms each",
+             w / 10.0, w ? h / 1000.0 / w : 0.0, m / 1000.0, r / 10.0, r ? rw / 1000.0 / r : 0.0);
+    ls_next = now + 10000;
+  }
+}
+static void __attribute__((thiscall)) ls_rlock(void *self) {
+  LARGE_INTEGER a, b;
+  QueryPerformanceCounter(&a);
+  tr_rlock(self);
+  QueryPerformanceCounter(&b);
+  InterlockedExchangeAdd(&ls_rwait_us, ls_us(a, b));
+  InterlockedIncrement(&ls_reads);
+}
+
+/* Jump fn to hook, keeping its first n bytes (whole instructions, position-
+ * independent, checked against want) in a trampoline that continues at fn+n. */
+static void *ls_hook(unsigned char *fn, const unsigned char *want, int n, void *hook) {
+  unsigned char *tr;
+  DWORD old;
+  int rel;
+  if (!fn || memcmp(fn, want, n))
+    return NULL;
+  tr = VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  if (!tr)
+    return NULL;
+  memcpy(tr, fn, n);
+  tr[n] = 0xE9;
+  rel = (int)((fn + n) - (tr + n + 5));
+  memcpy(tr + n + 1, &rel, 4);
+  if (!VirtualProtect(fn, 5, PAGE_EXECUTE_READWRITE, &old))
+    return NULL;
+  fn[0] = 0xE9;
+  rel = (int)((unsigned char *)hook - (fn + 5));
+  memcpy(fn + 1, &rel, 4);
+  VirtualProtect(fn, 5, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), fn, 5);
+  return tr;
+}
+
+static void install_lock_stats(HMODULE lle) {
+  static const unsigned char wl[5] = {0x56, 0x8b, 0xf1, 0x8b, 0x0e};       /* push esi; mov esi,ecx; mov ecx,[esi] */
+  static const unsigned char wu[6] = {0x56, 0x8b, 0xf1, 0x8b, 0x4e, 0x04}; /* ...; mov ecx,[esi+4] */
+  static const unsigned char rl[6] = {0x56, 0x8b, 0xf1, 0x8d, 0x46, 0x0c}; /* ...; lea eax,[esi+0xc] */
+  char b[8];
+  if (!lle || !(GetEnvironmentVariableA("EE_LOCK_STATS", b, sizeof b) > 0 && b[0] == '1'))
+    return;
+  QueryPerformanceFrequency(&ls_freq);
+  tr_wlock = (lockfn)ls_hook((unsigned char *)GetProcAddress(lle, "?WriteLock@TSReadWriteLock@@QAEXXZ"), wl, 5, (void *)ls_wlock);
+  tr_wunlock = (lockfn)ls_hook((unsigned char *)GetProcAddress(lle, "?WriteUnlock@TSReadWriteLock@@QAEXXZ"), wu, 6, (void *)ls_wunlock);
+  tr_rlock = (lockfn)ls_hook((unsigned char *)GetProcAddress(lle, "?ReadLock@TSReadWriteLock@@QAEXXZ"), rl, 6, (void *)ls_rlock);
+  ee_log("world lock stats: %s", tr_wlock && tr_wunlock && tr_rlock ? "on (every 10 s)" : "could not hook all three");
+}
+
+static void install_render_sleep(void) {
+  static const unsigned char want[8] = {0x6a, 0x01, 0xff, 0x15, 0x8c, 0x31, 0x82, 0x00}; /* push 1; call [Sleep] */
+  unsigned char *p = (unsigned char *)0x50fee6;
+  char b[8];
+  DWORD old;
+  int rel;
+  if (GetEnvironmentVariableA("EE_RENDER_SLEEP", b, sizeof b) > 0 && b[0] == '1') {
+    ee_log("render loop: Sleep(1) kept (EE_RENDER_SLEEP=1)");
+    return;
+  }
+  if (GetModuleHandleA(NULL) != (HMODULE)0x400000 || IsBadReadPtr(p, 8) || memcmp(p, want, 8)) {
+    ee_log("render loop: not the reversed Empire Earth.exe -- Sleep(1) left alone");
+    return;
+  }
+  if (!VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, &old))
+    return;
+  rel = (int)((char *)ee_render_sleep - (char *)(p + 5));
+  p[0] = 0xE8; /* call ee_render_sleep; nop x3 */
+  memcpy(p + 1, &rel, 4);
+  p[5] = p[6] = p[7] = 0x90;
+  VirtualProtect(p, 8, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), p, 8);
+  ee_log("render loop: Sleep(1) now yields while the game is in front");
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
@@ -933,6 +1076,22 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
     }
     SetUnhandledExceptionFilter(ee_last_chance);
     install_raise_detour();
+    /* The engine's hot x87 maths to SSE2 (ee-ssemath.h).  Low-Level Engine.dll
+     * is a static import of the game, so it is mapped by now, and no game
+     * thread has run yet -- the only safe moment to rewrite its code. */
+    {
+      char b[8];
+      HMODULE lle = GetModuleHandleA("Low-Level Engine.dll");
+      if (GetEnvironmentVariableA("EE_SSE_MATH", b, sizeof b) > 0 && b[0] == '0')
+        ee_log("sse maths: off (EE_SSE_MATH=0)");
+      else if (!lle)
+        ee_log("sse maths: Low-Level Engine.dll is not loaded -- nothing redirected");
+      else
+        ee_log("sse maths: %d of %d engine functions redirected to SSE2 (x87 control word 0x%04x at start)",
+               ee_ssemath_install(lle, ee_log), SSEM_N, ssem_cw());
+    }
+    install_render_sleep();
+    install_lock_stats(GetModuleHandleA("Low-Level Engine.dll"));
     load_real();
   }
   return TRUE;

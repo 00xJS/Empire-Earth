@@ -38,7 +38,19 @@ static int ee_verbose(void) {
 /* Throttling made the loading phase invisible -- thousands of texture surfaces
  * and locks now go unlogged, so a healthy load looks identical to a stall.
  * These counters are printed by the watchdog heartbeat instead. */
-static volatile LONG g_n_surfaces, g_n_locks, g_n_frames, g_n_blts;
+static volatile LONG g_n_surfaces, g_n_locks, g_n_frames, g_n_blts, g_n_bltfail;
+/* Where a frame's time goes (heartbeat dc=/rdc=/flip=): microseconds inside
+ * the real GetDC and ReleaseDC on the back buffer (D7VK downloads the frame
+ * for GDI text and uploads it again) and inside the real Flip. */
+static volatile LONG g_dc_us, g_dc_n, g_rdc_us, g_rdc_n, g_flip_us, g_flip_n, g_n_bltfix;
+static LONG us_since(const LARGE_INTEGER *t0) {
+  static LARGE_INTEGER f;
+  LARGE_INTEGER t1;
+  if (!f.QuadPart)
+    QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&t1);
+  return (LONG)((t1.QuadPart - t0->QuadPart) * 1000000 / f.QuadPart);
+}
 
 /* Page exchange state (see pages_prepare). */
 static CRITICAL_SECTION g_pages_cs;                   /* initialised in DllMain */
@@ -397,13 +409,19 @@ static DWORD WINAPI keep_foreground(void *arg) {
       SIZE_T got = 0;
       ReadProcessMemory(GetCurrentProcess(), (void *)0x7bf22ff0, redo, sizeof(redo), &got);
       LONG pn = g_pages_n, pu = g_pages_us;
+      LONG dc_us = InterlockedExchange(&g_dc_us, 0), dc_n = InterlockedExchange(&g_dc_n, 0);
+      LONG rdc_us = InterlockedExchange(&g_rdc_us, 0), rdc_n = InterlockedExchange(&g_rdc_n, 0);
+      LONG flip_us = InterlockedExchange(&g_flip_us, 0), flip_n = InterlockedExchange(&g_flip_n, 0);
       ee_log("progress: surfaces=%ld(+%ld) locks=%ld(+%ld) frames=%ld(+%ld) blts=%ld redo=%lu/%lu/%lu "
-             "pages=+%ld (%ld us each) softblt=+%ld fallback=%ld vbdraws=+%ld maxverts=%ld overruns=%ld",
+             "pages=+%ld (%ld us each) softblt=+%ld fallback=%ld vbdraws=+%ld maxverts=%ld overruns=%ld bltfail=%ld "
+             "bltfix=%ld dc=%ldus rdc=%ldus flip=%ldus",
              (long)cs, (long)(cs - last_s), (long)cl, (long)(cl - last_l), (long)cf, (long)(cf - last_f),
              (long)g_n_blts, got == sizeof(redo) ? redo[0] : 0UL, got == sizeof(redo) ? redo[1] : 0UL,
              got == sizeof(redo) ? redo[2] : 0UL, (long)(pn - last_pn),
              pn > last_pn ? (long)((pu - last_pu) / (pn - last_pn)) : 0L, (long)(g_soft_n - last_sn),
-             (long)g_soft_fallback, (long)(g_vb_draws - last_vd), (long)g_vb_maxverts, (long)g_vb_overruns);
+             (long)g_soft_fallback, (long)(g_vb_draws - last_vd), (long)g_vb_maxverts, (long)g_vb_overruns,
+             (long)g_n_bltfail, (long)g_n_bltfix, dc_n ? (long)(dc_us / dc_n) : 0L, rdc_n ? (long)(rdc_us / rdc_n) : 0L,
+             flip_n ? (long)(flip_us / flip_n) : 0L);
       last_vd = g_vb_draws;
       last_sn = g_soft_n;
       last_pn = pn;
@@ -995,9 +1013,30 @@ static HRESULT STDMETHODCALLTYPE hook_SurfGetDC(IDirectDrawSurface7 *this, HDC *
     if (hot_ok(&n_warn))
       ee_log("pages: GetDC on the primary (not redirected to the front page)");
   }
-  hr = orig_SurfGetDC ? orig_SurfGetDC(this, dc) : DDERR_GENERIC;
+  {
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
+    hr = orig_SurfGetDC ? orig_SurfGetDC(this, dc) : DDERR_GENERIC;
+    if (this == g_chain_back) {
+      InterlockedExchangeAdd(&g_dc_us, us_since(&t0));
+      InterlockedIncrement(&g_dc_n);
+    }
+  }
   if (loud || (FAILED(hr) && hot_ok(&n_fail)))
     ee_log("Surface::GetDC hr=0x%08lx", (unsigned long)hr);
+  return hr;
+}
+
+static HRESULT(STDMETHODCALLTYPE *orig_SurfReleaseDC)(IDirectDrawSurface7 *, HDC);
+static HRESULT STDMETHODCALLTYPE hook_SurfReleaseDC(IDirectDrawSurface7 *this, HDC dc) {
+  LARGE_INTEGER t0;
+  HRESULT hr;
+  QueryPerformanceCounter(&t0);
+  hr = orig_SurfReleaseDC ? orig_SurfReleaseDC(this, dc) : DDERR_GENERIC;
+  if (this == g_chain_back) {
+    InterlockedExchangeAdd(&g_rdc_us, us_since(&t0));
+    InterlockedIncrement(&g_rdc_n);
+  }
   return hr;
 }
 
@@ -1351,7 +1390,13 @@ static HRESULT STDMETHODCALLTYPE hook_SurfFlip(IDirectDrawSurface7 *this, IDirec
     }
     QueryPerformanceCounter(&t1);
   }
-  hr = orig_SurfFlip ? orig_SurfFlip(this, target, flags) : DDERR_GENERIC;
+  {
+    LARGE_INTEGER tf;
+    QueryPerformanceCounter(&tf);
+    hr = orig_SurfFlip ? orig_SurfFlip(this, target, flags) : DDERR_GENERIC;
+    InterlockedExchangeAdd(&g_flip_us, us_since(&tf));
+    InterlockedIncrement(&g_flip_n);
+  }
   /* Backstop for a lost surface (the main fix is declining wined3d's focus
    * hook, see hook_acquire_focus_window).  Wine's ddraw keeps surfaces "lost"
    * until Restore/RestoreAllSurfaces, which Empire Earth never calls mid-match.
@@ -1423,9 +1468,35 @@ static HRESULT STDMETHODCALLTYPE hook_SurfFlip(IDirectDrawSurface7 *this, IDirec
   return hr;
 }
 
+/* "0x12345678 640x480 caps=0x840 32bpp R00ff0000 G0000ff00 B000000ff A00000000" */
+static void describe_surf(IDirectDrawSurface7 *s, char *buf, size_t n) {
+  DDSURFACEDESC2 d;
+  const DDPIXELFORMAT *pf = &d.ddpfPixelFormat;
+  if (!s) {
+    snprintf(buf, n, "none");
+    return;
+  }
+  memset(&d, 0, sizeof d);
+  d.dwSize = sizeof d;
+  if (FAILED(s->lpVtbl->GetSurfaceDesc(s, &d))) {
+    snprintf(buf, n, "%p (no desc)", (void *)s);
+    return;
+  }
+  if (pf->dwFlags & DDPF_FOURCC)
+    snprintf(buf, n, "%p %lux%lu caps=0x%lx fourcc=%.4s", (void *)s, (unsigned long)d.dwWidth,
+             (unsigned long)d.dwHeight, (unsigned long)d.ddsCaps.dwCaps, (const char *)&pf->dwFourCC);
+  else
+    snprintf(buf, n, "%p %lux%lu caps=0x%lx %lubpp R%08lx G%08lx B%08lx A%08lx%s", (void *)s,
+             (unsigned long)d.dwWidth, (unsigned long)d.dwHeight, (unsigned long)d.ddsCaps.dwCaps,
+             (unsigned long)pf->dwRGBBitCount, (unsigned long)pf->dwRBitMask, (unsigned long)pf->dwGBitMask,
+             (unsigned long)pf->dwBBitMask, (unsigned long)pf->dwRGBAlphaBitMask,
+             (pf->dwFlags & DDPF_PALETTEINDEXED8) ? " pal8" : "");
+}
+
 static HRESULT STDMETHODCALLTYPE hook_SurfBlt(IDirectDrawSurface7 *this, LPRECT dst, IDirectDrawSurface7 *src, LPRECT sr,
                                               DWORD flags, DDBLTFX *fx) {
   HRESULT hr;
+  IDirectDrawSurface7 *to = this, *from = src;
   {
     static int n;
     if (n++ < 200)
@@ -1462,7 +1533,7 @@ static HRESULT STDMETHODCALLTYPE hook_SurfBlt(IDirectDrawSurface7 *this, LPRECT 
      * exchanged (see pages_prepare). */
     IDirectDrawSurface7 *pp = g_pages_primary;
     int guard = pp && (this == pp || src == pp);
-    IDirectDrawSurface7 *cf = g_chain_front, *cb = g_chain_back, *to = this, *from = src;
+    IDirectDrawSurface7 *cf = g_chain_front, *cb = g_chain_back;
     int chain = cb && (this == cb || src == cb || this == cf || src == cf);
     if (guard)
       EnterCriticalSection(&g_pages_cs);
@@ -1478,13 +1549,40 @@ static HRESULT STDMETHODCALLTYPE hook_SurfBlt(IDirectDrawSurface7 *this, LPRECT 
       hr = soft_blt(to, dst, from, sr, flags);
     if (hr == S_FALSE)
       hr = orig_SurfBlt ? orig_SurfBlt(to, dst, from, sr, flags, fx) : DDERR_GENERIC;
+    /* D7VK has no Blt into a texture: in a match the game copies a 64x64
+     * A4R4G4B4 system-memory image into a texture every frame (flags
+     * DDBLT_DONOTWAIT) and D7VK answers E_NOTIMPL, ~90 times a second on
+     * 25 Sep 2026, so that texture never changed.  A same-format copy is
+     * exactly what soft_blt does, through D7VK's own Lock/Unlock. */
+    if (hr == E_NOTIMPL && from && soft_blt(to, dst, from, sr, flags) == DD_OK) {
+      if (InterlockedIncrement(&g_n_bltfix) == 1)
+        ee_log("softblt: a Blt the real Blt refused (E_NOTIMPL, flags 0x%lx) is now copied on the CPU", (unsigned long)flags);
+      hr = DD_OK;
+    }
     if (guard)
       LeaveCriticalSection(&g_pages_cs);
   }
   g_n_blts++;
-  {
+  if (FAILED(hr)) {
+    /* The first 20 failures in full; after that only the heartbeat's bltfail=
+     * count (a custom map on 25 Sep 2026 failed ~90 blits a second with
+     * E_NOTIMPL, one log line each, and nothing said which blit). */
+    LONG nf = InterlockedIncrement(&g_n_bltfail);
+    if (nf <= 20) {
+      char ds[160], ss[160];
+      describe_surf(to, ds, sizeof ds);
+      describe_surf(from, ss, sizeof ss);
+      ee_log("Surface::Blt FAILED hr=0x%08lx (#%ld) flags=0x%lx fx=0x%lx dst[%s] %ld,%ld,%ld,%ld src[%s] %ld,%ld,%ld,%ld%s%s",
+             (unsigned long)hr, (long)nf, (unsigned long)flags, fx ? (unsigned long)fx->dwDDFX : 0UL, ds,
+             dst ? (long)dst->left : -1L, dst ? (long)dst->top : -1L, dst ? (long)dst->right : -1L,
+             dst ? (long)dst->bottom : -1L, ss, sr ? (long)sr->left : -1L, sr ? (long)sr->top : -1L,
+             sr ? (long)sr->right : -1L, sr ? (long)sr->bottom : -1L,
+             (to == g_chain_back || from == g_chain_back) ? " [back buffer]" : "",
+             (to == g_pages_front || from == g_pages_front) ? " [front page]" : "");
+    }
+  } else {
     static unsigned n;
-    if (hot_ok(&n) || FAILED(hr))
+    if (hot_ok(&n))
       ee_log("Surface::Blt hr=0x%08lx", (unsigned long)hr);
   }
   return hr;
@@ -1617,6 +1715,20 @@ static HRESULT STDMETHODCALLTYPE hook_DevBeginScene(IDirect3DDevice7 *this) {
   int loud = hot_ok(&n);
   if (loud)
     ee_log("Device7::BeginScene ENTER this=%p", (void *)this);
+  {
+    /* The render thread's x87 mode, whenever it changes: precision (bits 8-9)
+     * and rounding (10-11) decide how the engine's x87 maths rounds, which
+     * ee-version's SSE replacements reproduce per call. */
+    static unsigned short last_cw = 0xffff;
+    unsigned short cw;
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    if (cw != last_cw) {
+      static const char *pc[4] = {"24-bit", "reserved", "53-bit", "64-bit"}, *rc[4] = {"nearest", "down", "up", "chop"};
+      last_cw = cw;
+      ee_log("x87 control word on the render thread: 0x%04x (%s precision, round %s)", cw, pc[(cw >> 8) & 3],
+             rc[(cw >> 10) & 3]);
+    }
+  }
   hr = orig_DevBeginScene ? orig_DevBeginScene(this) : DDERR_GENERIC;
   g_n_frames++;
 
@@ -2070,6 +2182,8 @@ static void wrap_surf7(void *obj) {
     orig_SurfGetFlipStatus = (void *)vt[18];
   if (!orig_SurfUnlock)
     orig_SurfUnlock = (void *)vt[32];
+  if (!orig_SurfReleaseDC)
+    orig_SurfReleaseDC = (void *)vt[26];
   vt[5] = (void *)hook_SurfBlt;
   vt[17] = (void *)hook_SurfGetDC;
   vt[0] = (void *)hook_SurfQI;
@@ -2087,6 +2201,8 @@ static void wrap_surf7(void *obj) {
       char buf[16];
       extra = (GetEnvironmentVariableA("EE_DDRAW_EXTRA_HOOKS", buf, sizeof buf) > 0) ? atoi(buf) : 0;
     }
+    if (extra & 16)
+      vt[26] = (void *)hook_SurfReleaseDC; /* timing only */
     if (extra & 1)
       vt[7] = (void *)hook_SurfBltFast;
     if (extra & 2)
