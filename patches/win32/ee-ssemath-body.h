@@ -364,3 +364,143 @@ SSEM_FN static int SSEM_THIS SSEM(line_sphere)(const float *L, const float *P, f
   *t = (float)-((T)b / ((T)a + a));
   return 1;
 }
+
+/* ?NormalizePerspectiveCameraPoint@GEViewport@@QAEXABVGE3DPoint@@AAV2@AAM@Z
+ * (rva 0x5e0c): out = (in.x*s, in.z*s, in.y*k + c) with s, k, c at viewport
+ * +0x248/+0x24c/+0x250, then *w = in.y.  Callers pass out == in: each input is
+ * read after the store before it, as the x87 does.  *w went through an x87
+ * load and store, which quiets a signalling NaN. */
+SSEM_FN static void SSEM_THIS SSEM(norm_cam)(const char *vp, const float *in, float *out, float *w) {
+  const float s = *(const float *)(vp + 0x248);
+  unsigned u;
+  out[0] = (float)((T)in[0] * s);
+  out[1] = (float)((T)in[2] * *(const float *)(vp + 0x248));
+  out[2] = (float)((T)in[1] * *(const float *)(vp + 0x24c) + *(const float *)(vp + 0x250));
+  memcpy(&u, &in[1], 4);
+  if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x003fffffu) && !(u & 0x00400000u))
+    u |= 0x00400000u;
+  memcpy(w, &u, 4);
+}
+
+/* ?NormalizeOrthographicCameraPoint@GEViewport@@QAEXABVGE3DPoint@@AAV2@AAM@Z
+ * (rva 0x5dd1): the orthographic twin, with s, k, c at +0x23c/+0x240/+0x244
+ * and *w = 1. */
+SSEM_FN static void SSEM_THIS SSEM(norm_ortho)(const char *vp, const float *in, float *out, float *w) {
+  out[0] = (float)((T)in[0] * *(const float *)(vp + 0x23c));
+  out[1] = (float)((T)in[2] * *(const float *)(vp + 0x23c));
+  out[2] = (float)((T)in[1] * *(const float *)(vp + 0x240) + *(const float *)(vp + 0x244));
+  *w = 1.0f;
+}
+
+/* ?GetPixelSize@GERasterizer@@QAEMPAVGEModel@@PAVGEViewport@@AAVGETransformation@@M_N@Z
+ * (rva 0x3531d): the model's size on screen.  Its centre (model+0xc8) goes
+ * through the model's transform and the viewport's view transform (+0xf0),
+ * then x - r and x + r (r = the model's first radius, model[0x124][0], times
+ * scale) are projected, perspective or orthographic.  The width times the
+ * viewport's factor (+0x26c), or twice the factor when it comes out negative.
+ * A perspective w of zero (or NaN: the x87's je) counts as zero. */
+SSEM_FN static T SSEM_THIS SSEM(pixel_size)(const char *model, const char *vp, const float *xf, float scale, unsigned ortho) {
+  float A[3] = {0, 0, 0}, B[3] = {0, 0, 0}, w, ax, rsf, t1f;
+  const float f = *(const float *)(vp + 0x26c);
+  T rs, diff;
+  SSEM(apply_p3)(xf, (const float *)(model + 0xc8), B);
+  SSEM(apply_p3)((const float *)(vp + 0xf0), B, A);
+  rs = (T)**(const float *const *)(model + 0x124) * scale;
+  ax = A[0];
+  rsf = (float)rs;
+  A[0] = (float)((T)A[0] - rs);
+  if (!(ortho & 0xff)) {
+    SSEM(norm_cam)(vp, A, B, &w);
+    t1f = (w == 0 || w != w) ? 0.0f : (float)((T)B[0] / w);
+    A[0] = (float)((T)ax + rsf);
+    SSEM(norm_cam)(vp, A, B, &w);
+    diff = (w == 0 || w != w) ? (T)0 : (T)B[0] / w - t1f;
+  } else {
+    SSEM(norm_ortho)(vp, A, B, &w);
+    t1f = B[0];
+    A[0] = (float)((T)ax + rsf);
+    SSEM(norm_ortho)(vp, A, B, &w);
+    diff = (T)B[0] - t1f;
+  }
+  if (diff < 0 || diff != diff)
+    return (T)f + f;
+  return diff * f;
+}
+
+/* ?PrepareTransforms@GEModel@@QAEXXZ (rva 0x317f1): the model's world matrix
+ * (+0x88) = its parent's (+0x48) x (its animation frame's (+0xf0 array, 64
+ * bytes each, index +0x134) x its local one (+8)), the 3x3 part of the middle
+ * product scaled by +0x128, then the same for each child (+0xfc, count
+ * +0x13c).  The translation column is copied through the x87 (quieting a
+ * signalling NaN); the bottom row becomes 0 0 0 1. */
+SSEM_FN static void SSEM_THIS SSEM(prep_xf)(char *model) {
+  const float s = *(const float *)(model + 0x128);
+  const unsigned nch = *(const unsigned *)(model + 0x13c);
+  float tmp[16], sc[16];
+  unsigned i;
+  SSEM(apply_xf)((const float *)(*(const char *const *)(model + 0xf0) + (*(const int *)(model + 0x134) << 6)),
+                 (const float *)(model + 8), tmp);
+  for (i = 0; i < 3; i++) {
+    sc[4 * i] = (float)((T)tmp[4 * i] * s);
+    sc[4 * i + 1] = (float)((T)tmp[4 * i + 1] * s);
+    sc[4 * i + 2] = (float)((T)tmp[4 * i + 2] * s);
+    ssem_copyq(&sc[4 * i + 3], &tmp[4 * i + 3]);
+  }
+  sc[12] = sc[13] = sc[14] = 0;
+  sc[15] = 1;
+  SSEM(apply_xf)((const float *)(model + 0x48), sc, (float *)(model + 0x88));
+  for (i = 0; i < nch; i++)
+    SSEM(prep_xf)((*(char *const *const *)(model + 0xfc))[i]);
+}
+
+/* ?IsPerspectiveModelVisible@GERasterizer@@IAEXPAVGEModel@@MPAVGEViewport@@AAVGETransformation@@AA_N3@Z
+ * (rva 0x35772): frustum culling.  The model's centre (+0xc8) goes into camera
+ * space (its transform, then the viewport's +0xf0); the four side planes'
+ * normals (viewport +0x50/+0x68/+0x80/+0x98, normal at +0xc) are scaled by
+ * the radius r = model[0x124][model[0x134]] * scale and stored as floats.
+ * Out if the near distance (+0x264) is beyond y + r or the far one (+0x270)
+ * short of y - r; out unless centre + each normal is on or above its plane.
+ * Visible: flags in the model for near (+0x158), far (+0x159) and each plane
+ * the model crosses (centre - normal on or below it: +0x15c, +0x15d, +0x15a,
+ * +0x15b), and *clipped if any is set.  The flags use r stored as a float. */
+SSEM_FN static void SSEM_THIS SSEM(persp_vis)(unsigned char *model, float scale, const char *vp, const float *xf,
+                                              unsigned char *visible, unsigned char *clipped) {
+  static const unsigned short poff[4] = {0x50, 0x68, 0x80, 0x98}, foff[4] = {0x15c, 0x15d, 0x15a, 0x15b};
+  float P[3] = {0, 0, 0}, Q[3] = {0, 0, 0}, N[4][3], rf;
+  T r;
+  int i, k, sum;
+  for (i = 0; i < 4; i++)
+    memcpy(N[i], vp + poff[i] + 0xc, 12);
+  *visible = 0;
+  *clipped = 0;
+  SSEM(apply_p3)(xf, (const float *)(model + 0xc8), Q);
+  SSEM(apply_p3)((const float *)(vp + 0xf0), Q, P);
+  r = (T)(*(const float *const *)(model + 0x124))[*(const int *)(model + 0x134)] * scale;
+  rf = (float)r;
+  for (i = 0; i < 4; i++)
+    for (k = 0; k < 3; k++)
+      N[i][k] = (float)((T)N[i][k] * r);
+  if (*(const float *)(vp + 0x264) > (T)P[1] + r)
+    return;
+  if (!(*(const float *)(vp + 0x270) >= (T)P[1] - r))
+    return;
+  for (i = 0; i < 4; i++) {
+    Q[0] = (float)((T)N[i][0] + P[0]);
+    Q[1] = (float)((T)N[i][1] + P[1]);
+    Q[2] = (float)((T)N[i][2] + P[2]);
+    if (!SSEM(above)((const float *)(vp + poff[i]), Q))
+      return;
+  }
+  *visible = 1;
+  model[0x158] = *(const float *)(vp + 0x264) > (T)P[1] - rf;
+  model[0x159] = !(*(const float *)(vp + 0x270) >= (T)P[1] + rf);
+  sum = model[0x158] + model[0x159];
+  for (i = 0; i < 4; i++) {
+    Q[0] = (float)((T)P[0] - N[i][0]);
+    Q[1] = (float)((T)P[1] - N[i][1]);
+    Q[2] = (float)((T)P[2] - N[i][2]);
+    model[foff[i]] = (unsigned char)SSEM(below)((const float *)(vp + poff[i]), Q);
+    sum += model[foff[i]];
+  }
+  *clipped = sum != 0;
+}

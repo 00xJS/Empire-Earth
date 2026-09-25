@@ -43,6 +43,10 @@ static volatile LONG g_n_surfaces, g_n_locks, g_n_frames, g_n_blts, g_n_bltfail;
  * the real GetDC and ReleaseDC on the back buffer (D7VK downloads the frame
  * for GDI text and uploads it again) and inside the real Flip. */
 static volatile LONG g_dc_us, g_dc_n, g_rdc_us, g_rdc_n, g_flip_us, g_flip_n, g_n_bltfix;
+/* Frame pacing (heartbeat ft=): intervals between BeginScenes in ms buckets
+ * <8, 8-11, 11-14, 14-17, 17-20, 20-25, 25-33, 33-50, 50+, and the longest.
+ * The fps average hides the frames that wait out a whole simulation tick. */
+static volatile LONG g_ft[9], g_ft_max;
 static LONG us_since(const LARGE_INTEGER *t0) {
   static LARGE_INTEGER f;
   LARGE_INTEGER t1;
@@ -414,14 +418,19 @@ static DWORD WINAPI keep_foreground(void *arg) {
       LONG flip_us = InterlockedExchange(&g_flip_us, 0), flip_n = InterlockedExchange(&g_flip_n, 0);
       ee_log("progress: surfaces=%ld(+%ld) locks=%ld(+%ld) frames=%ld(+%ld) blts=%ld redo=%lu/%lu/%lu "
              "pages=+%ld (%ld us each) softblt=+%ld fallback=%ld vbdraws=+%ld maxverts=%ld overruns=%ld bltfail=%ld "
-             "bltfix=%ld dc=%ldus rdc=%ldus flip=%ldus",
+             "bltfix=%ld dc=%ldus rdc=%ldus flip=%ldus ft=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld max=%ldms",
              (long)cs, (long)(cs - last_s), (long)cl, (long)(cl - last_l), (long)cf, (long)(cf - last_f),
              (long)g_n_blts, got == sizeof(redo) ? redo[0] : 0UL, got == sizeof(redo) ? redo[1] : 0UL,
              got == sizeof(redo) ? redo[2] : 0UL, (long)(pn - last_pn),
              pn > last_pn ? (long)((pu - last_pu) / (pn - last_pn)) : 0L, (long)(g_soft_n - last_sn),
              (long)g_soft_fallback, (long)(g_vb_draws - last_vd), (long)g_vb_maxverts, (long)g_vb_overruns,
              (long)g_n_bltfail, (long)g_n_bltfix, dc_n ? (long)(dc_us / dc_n) : 0L, rdc_n ? (long)(rdc_us / rdc_n) : 0L,
-             flip_n ? (long)(flip_us / flip_n) : 0L);
+             flip_n ? (long)(flip_us / flip_n) : 0L, (long)InterlockedExchange(&g_ft[0], 0),
+             (long)InterlockedExchange(&g_ft[1], 0), (long)InterlockedExchange(&g_ft[2], 0),
+             (long)InterlockedExchange(&g_ft[3], 0), (long)InterlockedExchange(&g_ft[4], 0),
+             (long)InterlockedExchange(&g_ft[5], 0), (long)InterlockedExchange(&g_ft[6], 0),
+             (long)InterlockedExchange(&g_ft[7], 0), (long)InterlockedExchange(&g_ft[8], 0),
+             (long)InterlockedExchange(&g_ft_max, 0) / 1000);
       last_vd = g_vb_draws;
       last_sn = g_soft_n;
       last_pn = pn;
@@ -1755,6 +1764,18 @@ static HRESULT STDMETHODCALLTYPE hook_DevBeginScene(IDirect3DDevice7 *this) {
   }
   hr = orig_DevBeginScene ? orig_DevBeginScene(this) : DDERR_GENERIC;
   g_n_frames++;
+  {
+    static LARGE_INTEGER prev;
+    if (prev.QuadPart) {
+      const LONG us = us_since(&prev);
+      const int b = us < 8000 ? 0 : us < 11000 ? 1 : us < 14000 ? 2 : us < 17000 ? 3 : us < 20000 ? 4 : us < 25000 ? 5
+                  : us < 33000 ? 6 : us < 50000 ? 7 : 8;
+      InterlockedIncrement(&g_ft[b]);
+      if (us > g_ft_max)
+        g_ft_max = us;
+    }
+    QueryPerformanceCounter(&prev);
+  }
 
   if (SUCCEEDED(hr) && !g_rendering) {
     g_rendering = 1;

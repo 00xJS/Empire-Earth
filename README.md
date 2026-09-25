@@ -28,8 +28,8 @@ you are in another app.
 
 Big battles hold 90+ FPS. The benchmark is a late-game save of a custom map:
 367 units, a crowd of 150 soldiers on screen, about 1,100 objects moving.
-It runs at **101 FPS** (10th percentile 96) with the game's Animation
-Smoothing on. At the start of this work it managed 58 with smoothing
+It runs at **107 FPS** (10th percentile 102, never below 100) with the
+game's Animation Smoothing on. At the start of this work it managed 58 with smoothing
 off and 51 with it on. See [Big battles](#big-battles-the-engines-maths-on-sse2).
 
 ## Requirements
@@ -144,10 +144,11 @@ In big battles the game's own maths was the bottleneck, not the GPU.
 
 The `version.dll` proxy rewrites the hottest of that code in SSE2, bit for bit:
 
-- **Engine maths** in `Low-Level Engine.dll` (21 functions): point, vector
+- **Engine maths** in `Low-Level Engine.dll` (26 functions): point, vector
   and matrix transforms, plane tests, cosine, arc-cosine and arc-tangent,
-  bounding boxes, orientations, line-plane and line-sphere intersections, and
-  terrain height.
+  bounding boxes, orientations, line-plane and line-sphere intersections,
+  terrain height, camera projection, on-screen size, model transform chains
+  and frustum culling.
 - **Two loops in the renderer:** the terrain vertex fill, and Animation
   Smoothing's keyframe blend.
 
@@ -166,7 +167,8 @@ identical bits. `EE_SSE_MATH=0` turns it all off.
 | + no 1 ms sleep per frame in the render loop | 79.8 / 76.8 |
 | + terrain vertex fill on SSE2 (and more engine maths) | 92.8 / 89.7 |
 | + Animation Smoothing on SSE2, switched back on | 95.0 / 91.3 |
-| **+ terrain height, arc functions, line-sphere test (now)** | **101.1 / 95.9** |
+| + terrain height, arc functions, line-sphere test | 101.1 / 95.9 |
+| **+ projection, on-screen size, model transforms, frustum culling (now)** | **106.8 / 102.1** |
 
 **Animation Smoothing** blends every unit's model between animation keyframes,
 every frame. Without it, walk and attack cycles step from pose to pose and look

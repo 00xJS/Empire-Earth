@@ -69,6 +69,16 @@ SSEM_FN static int ssem_fistp(float t) {
   }
 }
 
+/* A float copied through an x87 load and store: bit for bit, except that a
+ * signalling NaN comes out quiet. */
+static inline void ssem_copyq(void *dst, const void *src) {
+  unsigned u;
+  memcpy(&u, src, 4);
+  if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x003fffffu) && !(u & 0x00400000u))
+    u |= 0x00400000u;
+  memcpy(dst, &u, 4);
+}
+
 #define T double
 #define SSEM(n) ssem_##n##_d
 #include "ee-ssemath-body.h"
@@ -131,6 +141,26 @@ static double ssem_umacos(float x) { return SSEM_PC24() ? (double)ssem_umacos_f(
 static double ssem_umatan2(float a, float b) { return SSEM_PC24() ? (double)ssem_umatan2_f(a, b) : ssem_umatan2_d(a, b); }
 static int SSEM_THIS ssem_line_sphere(const float *L, const float *P, float r, float *t) {
   return SSEM_PC24() ? ssem_line_sphere_f(L, P, r, t) : ssem_line_sphere_d(L, P, r, t);
+}
+static void SSEM_THIS ssem_norm_cam(const char *vp, const float *in, float *out, float *w) {
+  if (SSEM_PC24()) ssem_norm_cam_f(vp, in, out, w); else ssem_norm_cam_d(vp, in, out, w);
+}
+static void SSEM_THIS ssem_norm_ortho(const char *vp, const float *in, float *out, float *w) {
+  if (SSEM_PC24()) ssem_norm_ortho_f(vp, in, out, w); else ssem_norm_ortho_d(vp, in, out, w);
+}
+/* thiscall on the rasterizer, which it does not use */
+static double SSEM_THIS ssem_pixel_size(void *self, const char *model, const char *vp, const float *xf, float scale, unsigned ortho) {
+  (void)self;
+  return SSEM_PC24() ? (double)ssem_pixel_size_f(model, vp, xf, scale, ortho) : ssem_pixel_size_d(model, vp, xf, scale, ortho);
+}
+static void SSEM_THIS ssem_prep_xf(char *model) {
+  if (SSEM_PC24()) ssem_prep_xf_f(model); else ssem_prep_xf_d(model);
+}
+static void SSEM_THIS ssem_persp_vis(void *self, unsigned char *model, float scale, const char *vp, const float *xf,
+                                    unsigned char *visible, unsigned char *clipped) {
+  (void)self;
+  if (SSEM_PC24()) ssem_persp_vis_f(model, scale, vp, xf, visible, clipped);
+  else ssem_persp_vis_d(model, scale, vp, xf, visible, clipped);
 }
 static double SSEM_THIS ssem_meshz(const char *mesh, float x, float y) {
   return SSEM_PC24() ? (double)ssem_meshz_f(mesh, x, y) : ssem_meshz_d(mesh, x, y);
@@ -202,6 +232,11 @@ static const struct ssem_patch g_ssem_patches[] = {
     SSEM_P("?UMArcCos@@YAMM@Z", 224, 0xe66c78d8, umacos),
     SSEM_P("?UMArcTan2@@YAMMM@Z", 109, 0x542763d1, umatan2),
     SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPoint@@MAAM@Z", 392, 0x4add5f40, line_sphere),
+    SSEM_P("?NormalizePerspectiveCameraPoint@GEViewport@@QAEXABVGE3DPoint@@AAV2@AAM@Z", 60, 0x3fc6890c, norm_cam),
+    SSEM_P("?NormalizeOrthographicCameraPoint@GEViewport@@QAEXABVGE3DPoint@@AAV2@AAM@Z", 59, 0xb873b47a, norm_ortho),
+    SSEM_P("?GetPixelSize@GERasterizer@@QAEMPAVGEModel@@PAVGEViewport@@AAVGETransformation@@M_N@Z", 300, 0x9681a4dd, pixel_size),
+    SSEM_P("?PrepareTransforms@GEModel@@QAEXXZ", 227, 0x1a566115, prep_xf),
+    SSEM_P("?IsPerspectiveModelVisible@GERasterizer@@IAEXPAVGEModel@@MPAVGEViewport@@AAVGETransformation@@AA_N3@Z", 843, 0xc4526dbd, persp_vis),
 };
 #define SSEM_N ((int)(sizeof g_ssem_patches / sizeof g_ssem_patches[0]))
 
