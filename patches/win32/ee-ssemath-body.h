@@ -262,7 +262,8 @@ SSEM_FN static void SSEM(smooth)(const char *model, const char *mat, char *out, 
  * code does it: fistp, then one less if the unsigned 32-bit value is above the
  * float (a negative coordinate stays off the map, as in the original).  Rows
  * of 12 bytes {first column, -, float heights, 3 per column} hang off
- * this[0x17b578].  gx and the three products stored on the way are floats;
+ * this[g_ssem.meshz_rows] (0x17b578; AoC's larger mesh has it at 0x18f47c).
+ * gx and the three products stored on the way are floats;
  * the result is returned unrounded, like the x87's st(0). */
 SSEM_FN static T SSEM_THIS SSEM(meshz)(const char *mesh, float x, float y) {
   int ix = ssem_fistp(x), iy = ssem_fistp(y);
@@ -273,7 +274,7 @@ SSEM_FN static T SSEM_THIS SSEM(meshz)(const char *mesh, float x, float y) {
     ix--;
   if ((double)(unsigned)iy > y)
     iy--;
-  r0 = *(const char *const *)(mesh + 0x17b578) + iy * 12;
+  r0 = *(const char *const *)(mesh + g_ssem.meshz_rows) + iy * 12;
   d0 = *(const float *const *)(r0 + 8);
   d1 = *(const float *const *)(r0 + 0x14);
   c0 = ix - *(const int *)r0;

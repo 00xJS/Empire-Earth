@@ -27,6 +27,7 @@ static struct {
   float ac_lim, ac_scale, ac_c3, ac_c4, ac_c5, ac_clamp, ac_pi, ac_nhalf_pi;
   const float *ac_table;
   double(__cdecl *crt_sqrt)(double); /* the DLL's msvcrt sqrt, through its import table */
+  int meshz_rows; /* GETerrainMesh's row table: this+0x17b578, AoC's this+0x18f47c */
 } g_ssem;
 
 /* UMCos statistics (on with EE_LOCK_STATS=1): its range reduction steps the
@@ -223,20 +224,20 @@ static const struct ssem_patch g_ssem_patches[] = {
     {"??0GETransformation@@QAE@XZ", 82, 0x1a835b38, (void *)ssem_ctor},
     {"??0GE3DPlane@@QAE@XZ", 37, 0xe15509de, (void *)ssem_plane_ctor},
     {"??0GE3DLine@@QAE@XZ", 32, 0x445ed7ea, (void *)ssem_line_ctor},
-    {"??0GEBoundingBox@@QAE@XZ", 41, 0x895a38a8, (void *)ssem_bbox_ctor},
+    {"??0GEBoundingBox@@QAE@XZ", 41, 0x9ebce415, (void *)ssem_bbox_ctor},
     SSEM_P("?ComputeDimensions@GEBoundingBox@@AAEXXZ", 105, 0x46cedc3a, bbox_dims),
-    SSEM_P("?SetOrientationYPR@GETransformation@@QAEXMMM@Z", 244, 0xf582eacc, ypr),
+    SSEM_P("?SetOrientationYPR@GETransformation@@QAEXMMM@Z", 244, 0x9efe2558, ypr),
     SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPlane@@AAM@Z", 111, 0x0d9d1aad, line_plane),
     SSEM_P("?ComputeDirection@GE3DLine@@AAEXABVGE3DPoint@@@Z", 38, 0xeaab56a4, line_dir),
-    SSEM_P("?GetMeshZ@GETerrainMesh@@QBEMMM@Z", 242, 0x458f79b6, meshz),
-    SSEM_P("?UMArcCos@@YAMM@Z", 224, 0x88ed17fb, umacos),
-    SSEM_P("?UMArcTan2@@YAMMM@Z", 109, 0xb86f9ac9, umatan2),
-    SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPoint@@MAAM@Z", 392, 0x304b5817, line_sphere),
+    SSEM_P("?GetMeshZ@GETerrainMesh@@QBEMMM@Z", 242, 0x5076f0d6, meshz),
+    SSEM_P("?UMArcCos@@YAMM@Z", 224, 0x8cb89aaf, umacos),
+    SSEM_P("?UMArcTan2@@YAMMM@Z", 109, 0x66aca664, umatan2),
+    SSEM_P("?Intersects@GE3DLine@@QBE_NABVGE3DPoint@@MAAM@Z", 392, 0x89ee294d, line_sphere),
     SSEM_P("?NormalizePerspectiveCameraPoint@GEViewport@@QAEXABVGE3DPoint@@AAV2@AAM@Z", 60, 0x3fc6890c, norm_cam),
     SSEM_P("?NormalizeOrthographicCameraPoint@GEViewport@@QAEXABVGE3DPoint@@AAV2@AAM@Z", 59, 0xb873b47a, norm_ortho),
-    SSEM_P("?GetPixelSize@GERasterizer@@QAEMPAVGEModel@@PAVGEViewport@@AAVGETransformation@@M_N@Z", 300, 0x9681a4dd, pixel_size),
-    SSEM_P("?PrepareTransforms@GEModel@@QAEXXZ", 227, 0x1a566115, prep_xf),
-    SSEM_P("?IsPerspectiveModelVisible@GERasterizer@@IAEXPAVGEModel@@MPAVGEViewport@@AAVGETransformation@@AA_N3@Z", 843, 0xc4526dbd, persp_vis),
+    SSEM_P("?GetPixelSize@GERasterizer@@QAEMPAVGEModel@@PAVGEViewport@@AAVGETransformation@@M_N@Z", 300, 0xbe6df7f0, pixel_size),
+    SSEM_P("?PrepareTransforms@GEModel@@QAEXXZ", 227, 0xec541bc9, prep_xf),
+    SSEM_P("?IsPerspectiveModelVisible@GERasterizer@@IAEXPAVGEModel@@MPAVGEViewport@@AAVGETransformation@@AA_N3@Z", 843, 0xb9fe7460, persp_vis),
 };
 #define SSEM_N ((int)(sizeof g_ssem_patches / sizeof g_ssem_patches[0]))
 
@@ -284,6 +285,14 @@ static const struct { const char *fn, *callee; unsigned short off; } g_ssem_call
 };
 #define SSEM_MAG2_LEN 31 /* not replaced, but the line-sphere test inlines it */
 
+/* A struct-field displacement a replacement takes from the function's own
+ * instruction, as it takes constants from operands: Art of Conquest's classes
+ * grew, so the same code reads the field further along. */
+#define SSEM_MESHZ "?GetMeshZ@GETerrainMesh@@QBEMMM@Z"
+static const struct { const char *fn; unsigned short off; } g_ssem_fields[] = {
+    {SSEM_MESHZ, 0x42}, /* mov ecx,[ecx+disp32]: the mesh's row table (g_ssem.meshz_rows) */
+};
+
 /* FNV-1a of a function's bytes, with every base-relocated dword -- an absolute
  * address, which the loader rewrites (the game loads the DLL at 0x00B60000,
  * not its preferred 0x10000000) -- replaced by the four bytes it points at:
@@ -291,8 +300,11 @@ static const struct { const char *fn, *callee; unsigned short off; } g_ssem_call
  * the linker put them (Art of Conquest's copy keeps its constants elsewhere).
  * Import-table slots are left zero: their contents are only known at run time.
  * The replacements take their constants from the operands, never from fixed
- * addresses. */
-static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len) {
+ * addresses.  For g_ssem_patches' function `name' (NULL: none), the rel32 of
+ * each call in g_ssem_calls and each g_ssem_fields displacement are zeroed as
+ * well: where a call lands depends on the DLL's layout, and ssem_prepare checks
+ * every one of them against the callee itself. */
+static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len, const char *name) {
   const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
   const IMAGE_DATA_DIRECTORY *rd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
   const IMAGE_DATA_DIRECTORY *iat = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
@@ -329,6 +341,15 @@ static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len) {
       p += br->SizeOfBlock;
     }
   }
+  if (name) {
+    unsigned k;
+    for (k = 0; k < sizeof g_ssem_calls / sizeof g_ssem_calls[0]; k++)
+      if (!strcmp(g_ssem_calls[k].fn, name) && g_ssem_calls[k].off + 5u <= len)
+        memset(buf + g_ssem_calls[k].off + 1, 0, 4);
+    for (k = 0; k < sizeof g_ssem_fields / sizeof g_ssem_fields[0]; k++)
+      if (!strcmp(g_ssem_fields[k].fn, name) && g_ssem_fields[k].off + 4u <= len)
+        memset(buf + g_ssem_fields[k].off, 0, 4);
+  }
   return ssem_fnv(buf, len);
 }
 
@@ -361,7 +382,7 @@ static int ssem_find(const char *name);
 static void ssem_prepare(HMODULE lle, int *ok, void (*logf)(const char *fmt, ...)) {
   const unsigned char *b = (const unsigned char *)lle;
   const unsigned char *mag2 = (const unsigned char *)GetProcAddress(lle, SSEM_MAG2);
-  const int mag2_ok = mag2 && ssem_hash(b, (DWORD)(mag2 - b), SSEM_MAG2_LEN) == 0xd30e37d8u;
+  const int mag2_ok = mag2 && ssem_hash(b, (DWORD)(mag2 - b), SSEM_MAG2_LEN, NULL) == 0xd30e37d8u;
   int i, k, changed;
   for (i = 0; i < SSEM_N; i++) {
     const unsigned char *fn = (const unsigned char *)GetProcAddress(lle, g_ssem_patches[i].name);
@@ -372,7 +393,7 @@ static void ssem_prepare(HMODULE lle, int *ok, void (*logf)(const char *fmt, ...
         logf("sse maths: %s is not exported -- skipped", g_ssem_patches[i].name);
       continue;
     }
-    h = ssem_hash(b, (DWORD)(fn - b), g_ssem_patches[i].len);
+    h = ssem_hash(b, (DWORD)(fn - b), g_ssem_patches[i].len, g_ssem_patches[i].name);
     if (h != g_ssem_patches[i].fnv) {
       if (logf)
         logf("sse maths: %s is not the reversed code (fnv 0x%08x, want 0x%08x) -- left alone", g_ssem_patches[i].name, h,
@@ -437,6 +458,8 @@ static void ssem_prepare(HMODULE lle, int *ok, void (*logf)(const char *fmt, ...
     g_ssem.ac_nhalf_pi = *SSEM_OPND(fn, 0x5f);
     g_ssem.half_pi = *SSEM_OPND(fn, 0x67);
   }
+  if ((i = ssem_find(SSEM_MESHZ)) >= 0 && ok[i]) /* g_ssem_fields */
+    g_ssem.meshz_rows = *(const int *)((const unsigned char *)GetProcAddress(lle, SSEM_MESHZ) + 0x42);
   if ((i = ssem_find(SSEM_LSPH)) >= 0 && ok[i])
     g_ssem.crt_sqrt = ssem_sqrt_via((const unsigned char *)GetProcAddress(lle, SSEM_LSPH), 0x107);
 }
@@ -502,7 +525,7 @@ __asm__(".text\n.globl _ssem_tstub\n_ssem_tstub:\n"
  * DX7HRDisplay exports the same method with different code and is left alone. */
 static int ee_ssemath_terrain(HMODULE dx7, void (*logf)(const char *fmt, ...)) {
   static const unsigned char loop[10] = {0x8b, 0x02, 0x85, 0xc0, 0x0f, 0x84, 0x29, 0x02, 0x00, 0x00};
-  static unsigned logged;
+  static unsigned logged[2]; /* one per renderer: the game loads both, often */
   unsigned char *fn = (unsigned char *)GetProcAddress(dx7, SSEM_TNL_DTM), *at;
   unsigned h;
   DWORD old;
@@ -513,11 +536,13 @@ static int ee_ssemath_terrain(HMODULE dx7, void (*logf)(const char *fmt, ...)) {
   memcpy(&rel, at + 1, 4);
   if (at[0] == 0xE9 && at + 5 + rel == (unsigned char *)ssem_tstub)
     return 2;
-  h = ssem_hash((const unsigned char *)dx7, (DWORD)(fn - (unsigned char *)dx7), 766);
+  h = ssem_hash((const unsigned char *)dx7, (DWORD)(fn - (unsigned char *)dx7), 766, NULL);
   if (h != 0x26572550u || memcmp(at, loop, sizeof loop)) {
-    if (h != logged)
+    if (h != logged[0] && h != logged[1]) {
       logf("sse maths: DrawTerrainMaterial is not the reversed code (fnv 0x%08x) -- left alone", h);
-    logged = h;
+      logged[1] = logged[0];
+      logged[0] = h;
+    }
     return 0;
   }
   g_ssem.terrain_k = *SSEM_OPND(fn, 0xb3); /* the colour scale, as the loop's first fmul reads it */
@@ -559,7 +584,7 @@ static int ee_ssemath_smooth(HMODULE dx7, void (*logf)(const char *fmt, ...)) {
       n++;
       continue;
     }
-    h = ssem_hash((const unsigned char *)dx7, (DWORD)(fn - (unsigned char *)dx7), fns[i].len);
+    h = ssem_hash((const unsigned char *)dx7, (DWORD)(fn - (unsigned char *)dx7), fns[i].len, NULL);
     if (h != fns[i].fnv) {
       if (h != logged)
         logf("sse maths: %.40s is not the reversed code (fnv 0x%08x) -- left alone", fns[i].name, h);

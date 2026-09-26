@@ -93,6 +93,25 @@ for src, dest in keys.items():
     print(f"{dest}={shlex.quote(str(value or ''))}")
 PY
 )"
+  # dgVoodoo was the default until 24 Sep 2026 and does not reach the menu: a
+  # config saved with it moves to D7VK once (the marker lets a later deliberate
+  # choice of dgVoodoo stick).  Written here, since status.sh loads but never saves.
+  if [[ ! -f "$SUPPORT_DIR/.graphics-default-d7vk" ]]; then
+    if [[ "$GRAPHICS_STACK" == dgvoodoo ]] && python3 - "$CONFIG_FILE" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["graphics_stack"] = "d7vk"
+with open(path, "w") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+PY
+    then
+      GRAPHICS_STACK=d7vk
+      log "Graphics: moved the old dgVoodoo default (it does not reach the menu) to D7VK" >&2
+    fi
+    touch "$SUPPORT_DIR/.graphics-default-d7vk" 2>/dev/null || true
+  fi
   EE_GRAPHICS="${EE_GRAPHICS:-${GRAPHICS_STACK:-d7vk}}"
   # Keys missing from an older config.json load as empty strings.
   MUSIC_ENABLED="${MUSIC_ENABLED:-1}"

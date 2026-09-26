@@ -116,7 +116,8 @@ install_win32u_extent_patch() {
   if [[ ! -f "$bak" ]]; then
     cp -p "$so" "$bak"
   fi
-  python3 - "$so" "$bak" "$stamp" <<'PY'
+  local rc=0 # set -e: a missing pattern (exit 2) must reach the restore below
+  python3 - "$so" "$bak" "$stamp" <<'PY' || rc=$?
 from pathlib import Path
 import sys
 so, bak, stamp = map(Path, sys.argv[1:])
@@ -146,7 +147,6 @@ if patched:
 stamp.write_text(f"patched={patched} already={already}\n")
 sys.exit(0)
 PY
-  local rc=$?
   if [[ $rc -eq 2 ]]; then
     log "win32u extent patch: pattern not found, restoring original"
     cp -p "$bak" "$so"
@@ -203,6 +203,11 @@ install_dgvoodoo_279
 # D7VK is the default graphics stack; nothing else fetches it on a first run.
 "$SCRIPT_DIR/install-d7vk.sh" >/dev/null
 copy_repo_configs
+# The three Wine fixes below are written for, and only ever patch, the pinned
+# Wine Stable 11.0_1 in the runtime folder -- never a Wine installed elsewhere.
+if [[ ! -d "$RUNTIME_DIR/Wine Stable.app" ]]; then
+  log "WARNING: $RUNTIME_DIR/Wine Stable.app is missing, so the Rosetta and Vulkan fixes are not applied and the game is likely to crash at start-up. Install it with the launcher's Install Wine button or scripts/install-wine.sh."
+fi
 install_win32u_extent_patch
 install_wow64cpu_rosetta_patch
 install_moltenvk_shim

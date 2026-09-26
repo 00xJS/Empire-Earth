@@ -177,10 +177,16 @@ frame with 150+ units on screen, so the launcher used to turn it off. On SSE2 it
 costs 4 ns, and the launcher now turns it on (`EE_ANIMATION_SMOOTHING=0` for the
 last few FPS).
 
-**Art of Conquest** does not get these yet. Its launch does not load the
-`version.dll` proxy that carries them, so it keeps Animation Smoothing off, as
-before. (Its own engine and renderer DLLs are checked too: 17 of the 26 engine
-functions and both smoothing loops are the same code there, and would go in.)
+**Art of Conquest** gets them too. Its `EE-AOC.exe` does not import
+`version.dll`, but D7VK's ddraw does, so with a Wine override for `EE-AOC.exe`
+the proxy arrives during the engine's start-up scan, on the main thread before
+the menu. Its engine is the same code with its classes grown and its DLL laid
+out differently, so the byte check leaves out call offsets (each call is checked
+against its callee instead) and reads the one moved field from the instruction.
+All 26 engine functions, both smoothing loops and the render-loop fix go in; its
+terrain vertex fill is different code and stays the game's own. Animation
+Smoothing is now on there as well. Early in a random map: 128 FPS before,
+169 FPS now.
 
 **The simulation keeps the same speed however busy the map is.** It runs on
 its own thread, and the game's synchronous server (built for multiplayer, used
@@ -286,7 +292,10 @@ the same value. It plays in matches; the menus have none.
   race in Wine's 32↔64-bit thunks (`wow64cpu.dll+0x123d`/`+0x1139`) — is fixed by
   `patches/wine/patch-wow64cpu.py`, which the installer applies. About one start
   in ten still stalls on the opening banner (the game's own thread stuck in
-  Wine's `DestroyWindow` on a 16×16 test window); the retry covers it.
+  Wine's `DestroyWindow` on a 16×16 test window); the retry covers it. Art of
+  Conquest used to stall there on about four starts in ten: its loading banner
+  never marks itself painted, so Wine repaints it without end. The base game's
+  fix for that now reaches it too (none in eight starts since, 25 Sep 2026).
 - **A rare crash late in big matches.** Twice (23–24 Sep 2026) the game's memory
   jumped from about 1.2 GB to 3.8 GB within a minute and it crashed writing
   through a null pointer once the heap was empty. The crash logger traced the
@@ -340,7 +349,7 @@ committed here.
 | `EE_EMULATE_MODESET=0` | use a virtual desktop instead of Wine-emulated display modes (menu 1:1, top-left) |
 | `EE_VKFIX_NOEXEC=0` | leave Vulkan's imported memory executable (brings back the long freezes) |
 | `EE_ANIMATION_SMOOTHING=0` | turn the game's Animation Smoothing off: units step between animation poses; about 9% more FPS in big battles |
-| `EE_AOC_ANIMATION_SMOOTHING=1` | turn Animation Smoothing on in Art of Conquest (off by default there: without the SSE2 blend it is slow in big battles) |
+| `EE_AOC_ANIMATION_SMOOTHING=0` | turn Animation Smoothing off in Art of Conquest |
 | `EE_SSE_MATH=0` | run the engine's and renderer's original x87 code instead of the SSE2 rewrites (much slower in big battles) |
 | `EE_RENDER_SLEEP=1` | keep the render loop's 1 ms sleep after every frame (it now only yields the CPU) |
 | `EE_DDRAW_MATCH_GETDC=0` | only a `Lock` of the back buffer marks a match frame again, not `GetDC` (every match frame then pays the full page exchange) |

@@ -18,6 +18,14 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 static HMODULE g_real;
 static HMODULE g_self;
 static FILE *g_log;
+/* 1 in Empire Earth.exe, which imports this DLL.  Art of Conquest's EE-AOC.exe
+ * does not: there it arrives through D7VK's ddraw_eeorig.dll (which imports
+ * VERSION.dll) during the engine's plugin scan -- on the main thread, after
+ * the splash, before any game thread runs the engine's maths.  AoC gets the
+ * engine and renderer speed-ups, the render-loop fix and the splash fix; the
+ * display-mode and window hooks were written for Empire Earth.exe and stay out
+ * of the other game. */
+static int g_ee_exe;
 
 static HWND(WINAPI *orig_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU,
                                           HINSTANCE, LPVOID);
@@ -216,12 +224,14 @@ static LRESULT CALLBACK ee_splash_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
   LRESULT r;
   if (!g_splash_orig)
     return DefWindowProcA(hwnd, msg, wp, lp);
+  static int n;
   r = CallWindowProcA(g_splash_orig, hwnd, msg, wp, lp);
   if (msg == WM_PAINT) {
-    static int n;
     ValidateRect(hwnd, NULL);
     if (n++ < 3)
       ee_log("splash WM_PAINT validated (storm suppressed)");
+  } else if (msg == WM_NCDESTROY) {
+    ee_log("splash closed after %d WM_PAINT", n);
   }
   return r;
 }
@@ -247,6 +257,17 @@ static void tame_splash(HWND hwnd, const char *cls) {
   }
   g_splash_orig = (WNDPROC)(LONG_PTR)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)ee_splash_proc);
   ee_log("subclassed splash hwnd=%p to stop the WM_PAINT storm", (void *)hwnd);
+}
+
+/* AoC shows the same splash, but this DLL arrives after it is created: find it. */
+static BOOL CALLBACK tame_splash_enum(HWND hwnd, LPARAM lp) {
+  char cls[64];
+  DWORD pid = 0;
+  (void)lp;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == GetCurrentProcessId() && GetClassNameA(hwnd, cls, sizeof cls))
+    tame_splash(hwnd, cls);
+  return !g_splash_orig;
 }
 
 static int patch_iat(HMODULE mod, const char *dllwant, const char *fn, void *hook) {
@@ -494,8 +515,10 @@ static void patch_crt(HMODULE mod) {
 static void patch_rasterizer(HMODULE mod) {
   if (!mod)
     return;
-  patch_iat(mod, "user32.dll", "CreateWindowExA", (void *)hook_CreateWindowExA);
-  patch_iat(mod, "user32.dll", "AdjustWindowRect", (void *)hook_AdjustWindowRect);
+  if (g_ee_exe) {
+    patch_iat(mod, "user32.dll", "CreateWindowExA", (void *)hook_CreateWindowExA);
+    patch_iat(mod, "user32.dll", "AdjustWindowRect", (void *)hook_AdjustWindowRect);
+  }
   patch_iat(mod, "msvcrt.dll", "abort", (void *)hook_abort);
   patch_iat(mod, "msvcrt.dll", "raise", (void *)hook_raise);
   /* DX7HRTnLDisplay's terrain vertex loop to SSE2 (ee-ssemath.h).  The game
@@ -610,7 +633,11 @@ static void install_mode_hooks(void) {
     return;
   once = 1;
   resolve_orig();
-  patch_exe_modes(GetModuleHandleA(NULL));
+  if (g_ee_exe)
+    patch_exe_modes(GetModuleHandleA(NULL));
+  else /* keeps the crash log in front of the game's own filter, which it calls */
+    patch_iat(GetModuleHandleA(NULL), "kernel32.dll", "SetUnhandledExceptionFilter",
+              (void *)hook_SetUnhandledExceptionFilter);
   engine = GetModuleHandleA("Low-Level Engine.dll");
   if (engine) {
     patch_iat(engine, "kernel32.dll", "LoadLibraryA", (void *)hook_LoadLibraryA);
@@ -1244,17 +1271,27 @@ static void install_lock_stats(HMODULE lle) {
 }
 
 static void install_render_sleep(void) {
-  static const unsigned char want[8] = {0x6a, 0x01, 0xff, 0x15, 0x8c, 0x31, 0x82, 0x00}; /* push 1; call [Sleep] */
-  unsigned char *p = (unsigned char *)0x50fee6;
+  /* push 1; call [Sleep], then the loop's cmp byte [esi+0x59],0: Empire Earth.exe,
+   * and the same loop in EE-AOC.exe with its own Sleep import slot */
+  static const struct { DWORD at, sleep_slot; } sites[] = {{0x50fee6, 0x82318c}, {0x51a4a5, 0x837174}};
+  static const unsigned char loop_test[4] = {0x80, 0x7e, 0x59, 0x00};
+  unsigned char want[8] = {0x6a, 0x01, 0xff, 0x15}, *p = NULL;
   char b[8];
   DWORD old;
   int rel;
+  unsigned i;
   if (GetEnvironmentVariableA("EE_RENDER_SLEEP", b, sizeof b) > 0 && b[0] == '1') {
     ee_log("render loop: Sleep(1) kept (EE_RENDER_SLEEP=1)");
     return;
   }
-  if (GetModuleHandleA(NULL) != (HMODULE)0x400000 || IsBadReadPtr(p, 8) || memcmp(p, want, 8)) {
-    ee_log("render loop: not the reversed Empire Earth.exe -- Sleep(1) left alone");
+  for (i = 0; i < sizeof sites / sizeof sites[0] && GetModuleHandleA(NULL) == (HMODULE)0x400000; i++) {
+    unsigned char *at = (unsigned char *)(ULONG_PTR)sites[i].at;
+    memcpy(want + 4, &sites[i].sleep_slot, 4);
+    if (!IsBadReadPtr(at, 12) && !memcmp(at, want, 8) && !memcmp(at + 8, loop_test, 4))
+      p = at;
+  }
+  if (!p) {
+    ee_log("render loop: not a reversed exe -- Sleep(1) left alone");
     return;
   }
   if (!VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, &old))
@@ -1268,11 +1305,43 @@ static void install_render_sleep(void) {
   ee_log("render loop: Sleep(1) now yields while the game is in front");
 }
 
+/* Other threads in this process: where the engine is patched after WinMain
+ * started (AoC), the log shows what could have been running at the time. */
+static int other_threads(void) {
+  THREADENTRY32 te;
+  DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+  int n = 0;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snap == INVALID_HANDLE_VALUE)
+    return -1;
+  te.dwSize = sizeof te;
+  if (Thread32First(snap, &te)) {
+    do {
+      if (te.th32OwnerProcessID == pid && te.th32ThreadID != me)
+        n++;
+    } while (Thread32Next(snap, &te));
+  }
+  CloseHandle(snap);
+  return n;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
+    char exe[MAX_PATH];
+    const char *base = NULL;
+    HMODULE pin;
+    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
     g_self = inst;
     DisableThreadLibraryCalls(inst);
+    if (n && n < sizeof exe)
+      base = strrchr(exe, '\\');
+    g_ee_exe = !base || !lstrcmpiA(base + 1, "Empire Earth.exe");
+    /* The engine's patched code jumps into this DLL, so it must never unload:
+     * in AoC it comes in with a DLL the plugin scan loads and frees again. */
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)inst, &pin);
+    if (!g_ee_exe)
+      ee_log("%s: loaded after start-up (%d other threads) -- no display-mode hooks here", base + 1, other_threads());
     /* Shared msvcrt => this lands in the same CRT signal table the game uses. */
     signal(SIGABRT, ee_abort_handler);
     /* The VEH identified the intermittent early crash as wow64cpu.dll+0x123d
@@ -1285,11 +1354,17 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
       if (GetEnvironmentVariableA("EE_VEH", b, sizeof b) > 0 && b[0] == '1')
         AddVectoredExceptionHandler(1, ee_veh);
     }
-    SetUnhandledExceptionFilter(ee_last_chance);
+    {
+      /* AoC may have set its own filter before this DLL arrived: chain to it. */
+      LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(ee_last_chance);
+      if (prev && prev != ee_last_chance && !g_game_filter)
+        g_game_filter = prev;
+    }
     install_raise_detour();
     /* The engine's hot x87 maths to SSE2 (ee-ssemath.h).  Low-Level Engine.dll
      * is a static import of the game, so it is mapped by now, and no game
-     * thread has run yet -- the only safe moment to rewrite its code. */
+     * thread has run yet -- the only safe moment to rewrite its code.  (In AoC,
+     * see g_ee_exe: the plugin scan, on the main thread before the menu.) */
     {
       char b[8];
       HMODULE lle = GetModuleHandleA("Low-Level Engine.dll");
@@ -1309,6 +1384,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
     ft_install("lle", GetModuleHandleA("Low-Level Engine.dll"), ee_log); /* EE_FUNCTIME */
     ft_install("exe", NULL, ee_log);
     load_real();
+    if (!g_ee_exe) {
+      /* Renderers mapped before this DLL arrived; later loads come through
+       * the engine's LoadLibrary hooks. */
+      patch_rasterizer(GetModuleHandleA("DX7HRTnLDisplay.dll"));
+      patch_rasterizer(GetModuleHandleA("DX7HRDisplay.dll"));
+      EnumWindows(tame_splash_enum, 0);
+    }
   }
   return TRUE;
 }

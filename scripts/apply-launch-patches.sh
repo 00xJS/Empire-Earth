@@ -196,18 +196,26 @@ install_windowed_wrappers() {
   log "Installed 800x600 windowed DXGI wrappers in $dest"
 }
 
+# version.dll carries the engine speed-ups (both games) and the early 800x600
+# display-mode shim (Empire Earth.exe only). It forwards to Wine's own
+# version.dll, copied from the Wine in use. Without it the "native,builtin"
+# override below falls back to Wine's, so a failed install only loses speed.
 install_version_shim() {
   local dest="$1"
   local helpers="$SUPPORT_DIR/patches/win32"
-  local orig="$RUNTIME_DIR/Wine Stable.app/Contents/Resources/wine/lib/wine/i386-windows/version.dll"
+  local orig
+  orig="$(cd "$(dirname "$wine_path")/.." 2>/dev/null && pwd -P)/lib/wine/i386-windows/version.dll"
   [[ -d "$dest" ]] || return 0
   if [[ ! -f "$helpers/version.dll" ]]; then
     "$SCRIPT_DIR/build-win32-helpers.sh" >/dev/null || true
   fi
-  [[ -f "$helpers/version.dll" && -f "$orig" ]] || return 0
+  if [[ ! -f "$helpers/version.dll" || ! -f "$orig" ]]; then
+    log "WARNING: version.dll shim not installed in $dest (built: $([[ -f "$helpers/version.dll" ]] && echo yes || echo no); Wine's copy: $orig) -- no engine speed-ups"
+    return 0
+  fi
   cp "$orig" "$dest/version_eeorig.dll"
   cp "$helpers/version.dll" "$dest/version.dll"
-  log "Installed early 800x600 display-mode shim (version.dll)"
+  log "Installed the version.dll shim in $dest"
 }
 
 install_dxvk() {
@@ -604,7 +612,11 @@ reg "HKCU\\Software\\Wine\\WineDbg" "ShowCrashDialog" "REG_DWORD" "0"
 # winecfg -v can open a GUI and hang under the Mac driver. Set XP via registry.
 reg "HKCU\\Software\\Wine" "Version" "REG_SZ" "winxp"
 reg "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe" "Version" "REG_SZ" "winxp"
-reg "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\DllOverrides" "version" "REG_SZ" "native"
+# Our version.dll (install_version_shim) when it is in the game folder, Wine's
+# otherwise. EE-AOC.exe does not import it; D7VK's ddraw does, which is how
+# Art of Conquest picks up the engine speed-ups.
+reg "HKCU\\Software\\Wine\\AppDefaults\\Empire Earth.exe\\DllOverrides" "version" "REG_SZ" "native,builtin"
+reg "HKCU\\Software\\Wine\\AppDefaults\\EE-AOC.exe\\DllOverrides" "version" "REG_SZ" "native,builtin"
 
 reg "HKCU\\Software\\Wine\\Direct3D" "VideoMemorySize" "REG_SZ" "2048"
 if [[ "${EE_GRAPHICS:-d7vk}" == "dgvoodoo-wined3d" ]]; then
@@ -697,11 +709,11 @@ reg "HKCU\\Software\\SSSI\\Empire Earth" "UseCandidateWindow" "REG_DWORD" "0"
 # and the big-battle benchmark is as fast with it as without.  The game has no
 # menu option for it (registry only; it rewrites the value on exit, so set it
 # on every launch).  EE_ANIMATION_SMOOTHING=0 turns it off.
-# Art of Conquest does not load ee-version (the shim goes into the base game's
-# folder only), so it would run the old x87 blend: off there, as before,
-# unless EE_AOC_ANIMATION_SMOOTHING=1.
+# Art of Conquest's renderers carry the same two loops and get the same SSE2
+# blend (the shim goes into its folder too): on there as well,
+# EE_AOC_ANIMATION_SMOOTHING=0 turns it off.
 reg "HKCU\\Software\\SSSI\\Empire Earth" "Animation Smoothing" "REG_DWORD" "${EE_ANIMATION_SMOOTHING:-1}"
-reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_AOC_ANIMATION_SMOOTHING:-0}"
+reg "HKCU\\Software\\Mad Doc Software\\EE-AOC" "Animation Smoothing" "REG_DWORD" "${EE_AOC_ANIMATION_SMOOTHING:-1}"
 # Art of Conquest keeps its own copy of every display setting.  Left at its
 # defaults (16-bit colour and textures, 800x600) it drew one frame and then hung
 # in Wine's OpenGL ddraw path on a black screen (23 Sep 2026).
@@ -753,5 +765,6 @@ if [[ -n "${GAME_DIR:-}" && -d "$GAME_DIR" ]]; then
 fi
 if [[ -n "${AOC_EXE:-}" && -f "$AOC_EXE" ]]; then
   install_graphics "$(cd "$(dirname "$AOC_EXE")" && pwd)"
+  install_version_shim "$(cd "$(dirname "$AOC_EXE")" && pwd)"
 fi
 log "Launch patches applied"
