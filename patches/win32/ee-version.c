@@ -595,10 +595,13 @@ static void probe_once_install(HMODULE mod) {
   }
 }
 
+static void ds_install(HMODULE mod); /* ee-drawstats.h */
+
 static void patch_rasterizer(HMODULE mod) {
   if (!mod)
     return;
   probe_once_install(mod);
+  ds_install(mod);
   if (g_ee_exe) {
     patch_iat(mod, "user32.dll", "CreateWindowExA", (void *)hook_CreateWindowExA);
     patch_iat(mod, "user32.dll", "AdjustWindowRect", (void *)hook_AdjustWindowRect);
@@ -924,6 +927,42 @@ static LONG CALLBACK ee_veh(EXCEPTION_POINTERS *ep) {
  * is hooked: ours stays in front and hands on to the game's. */
 static LPTOP_LEVEL_EXCEPTION_FILTER g_game_filter;
 
+/* The game is a 32-bit, large-address-aware program: it has 4 GB of address
+ * space and no more.  A gigantic map with thousands of units filled it on 27
+ * Sep 2026 (the save's in-memory file could not grow by 1 MB and the game's
+ * own code wrote through the null it got back), so the address space is
+ * logged every 10 s with EE_LOCK_STATS=1, and in every crash report. */
+static void vm_log(const char *what) {
+  MEMORY_BASIC_INFORMATION mbi;
+  ULONG_PTR a = 0x10000;
+  ULONGLONG commit = 0, reserve = 0, freeb = 0, maxfree = 0, priv = 0, mapped = 0, image = 0;
+  while (a < 0xFFFF0000UL && VirtualQuery((void *)a, &mbi, sizeof mbi) == sizeof mbi && mbi.RegionSize) {
+    ULONGLONG sz = mbi.RegionSize;
+    if (mbi.State == MEM_FREE) {
+      freeb += sz;
+      if (sz > maxfree)
+        maxfree = sz;
+    } else if (mbi.State == MEM_RESERVE)
+      reserve += sz;
+    else {
+      commit += sz;
+      if (mbi.Type == MEM_PRIVATE)
+        priv += sz;
+      else if (mbi.Type == MEM_MAPPED)
+        mapped += sz;
+      else if (mbi.Type == MEM_IMAGE)
+        image += sz;
+    }
+    if ((ULONGLONG)a + sz >= 0xFFFF0000ULL)
+      break;
+    a += (ULONG_PTR)sz;
+  }
+  ee_log("%saddress space: %u MB committed (private %u, mapped %u, images %u), %u MB reserved, %u MB free, largest free "
+         "block %u MB",
+         what, (unsigned)(commit >> 20), (unsigned)(priv >> 20), (unsigned)(mapped >> 20), (unsigned)(image >> 20),
+         (unsigned)(reserve >> 20), (unsigned)(freeb >> 20), (unsigned)(maxfree >> 20));
+}
+
 static LONG WINAPI ee_last_chance(EXCEPTION_POINTERS *ep) {
   static LONG once;
   if (ep && ep->ExceptionRecord && !InterlockedExchange(&once, 1)) {
@@ -934,6 +973,7 @@ static LONG WINAPI ee_last_chance(EXCEPTION_POINTERS *ep) {
       ee_log("    %s address %p", er->ExceptionInformation[0] ? "write to" : "read from",
              (void *)er->ExceptionInformation[1]);
     describe_addr("fault pc", er->ExceptionAddress);
+    vm_log("    ");
     if (ep->ContextRecord) {
       log_ctx_stack(ep->ContextRecord);
       ee_log("  raw stack scan:");
@@ -1199,6 +1239,7 @@ static void __attribute__((thiscall)) ls_wunlock(void *self) {
       for (i = 0; i < 8; i++)
         ls_site[i].n = ls_site[i].us = 0;
       ls_log_timers();
+      vm_log("");
       ls_log_readers();
       ls_log_umcos();
       ct_report(ee_log, 10.0);
@@ -1298,6 +1339,12 @@ static void *ls_hook(unsigned char *fn, const unsigned char *want, int n, void *
   FlushInstructionCache(GetCurrentProcess(), fn, 5);
   return tr;
 }
+
+#include "ee-keys.h"   /* Mac keys for Del and the keypad's + and - (EE_MAC_KEYS=0 off) */
+#include "ee-armies.h" /* unit limit to 10000, drag-select past 63 (EE_BIG_ARMIES=0 off) */
+#include "ee-memfile.h" /* saves grow their in-memory file by doubling (EE_MEMFILE_DOUBLE=0 off) */
+#include "ee-drawstats.h" /* EE_DRAWSTATS=1: models drawn per frame (diagnostics) */
+#include "ee-crowds.h" /* 10000 draw slots for units on screen, was 512 (EE_BIG_CROWDS=0 off) */
 
 /* ---- multimedia timers (EE_LOCK_STATS=1 logs them) ------------------------
  * The engine's TMTimer is winmm timeSetEvent; the simulation ticks on a 33 ms
@@ -1492,6 +1539,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
       x87t_install(g_ee_exe ? x87t_fns : aoc ? x87t_aoc_fns : NULL, GetModuleHandleA("Low-Level Engine.dll"), ee_log);
     }
     install_lock_stats(GetModuleHandleA("Low-Level Engine.dll"));
+    keys_install(GetModuleHandleA("Low-Level Engine.dll"), ee_log);
+    memfile_install(GetModuleHandleA("Low-Level Engine.dll"), ee_log);
+    armies_install(ee_log);
+    crowd_install(ee_log, g_ee_exe);
     ct_install(ee_log); /* EE_CALLTIME (with EE_LOCK_STATS=1): see ee-calltime.h */
     sh_install(ee_log); /* EE_SIMHASH=1: per-tick world checksum, see ee-calltime.h */
     share_install(ee_log); /* EE_PHYSICS_SHARE=<percent> */
