@@ -168,7 +168,8 @@ identical bits. `EE_SSE_MATH=0` turns it all off.
 | + terrain vertex fill on SSE2 (and more engine maths) | 92.8 / 89.7 |
 | + Animation Smoothing on SSE2, switched back on | 95.0 / 91.3 |
 | + terrain height, arc functions, line-sphere test | 101.1 / 95.9 |
-| **+ projection, on-screen size, model transforms, frustum culling (now)** | **106.8 / 102.1** |
+| + projection, on-screen size, model transforms, frustum culling | 106.8 / 102.1 |
+| **+ the simulation's physics translated (now, 26 Sep; that day's run without it: 111.7 / 107.4)** | **132.7 / 124.9** |
 
 **Animation Smoothing** blends every unit's model between animation keyframes,
 every frame. Without it, walk and attack cycles step from pose to pose and look
@@ -194,8 +195,46 @@ in single player too) sets how many physics steps it takes per second:
 `ticks/s = 10 × 30 / (average tick ms)`. That keeps the simulation to 30% of
 one CPU. Each step covers proportionally more game time, so the game runs at
 normal speed either way (measured: the same distance moved per second at 24 and
-at 94 steps a second). What changes is how finely movement is stepped. A heavy
-map steps units about 25 times a second instead of 30.
+at 94 steps a second). What changes is how finely movement is stepped: a busy
+map gets fewer, longer steps.
+
+**The simulation's own maths, translated.** Unit physics and unit updates (how
+land units, ships, animals, projectiles and buildings move, turn and push each
+other apart) are the game's own x87 code in `Empire Earth.exe`, over a thousand
+x87 instructions in the land model alone, and each simulation step keeps the
+whole world locked while it runs, so the renderer waits it out. Rather than
+rewrite that much by hand, the `version.dll` proxy translates it at start-up: it
+rebuilds each function from the game's own code with the x87 register stack kept
+in SSE2 registers: 64 functions in the base game and 7 in the engine. Art of
+Conquest takes the engine's 7; its own copies of the game's 52 are translated
+too, but stay off until they pass the same in-game check (`EE_X87T_AOC=1`).
+
+The simulation thread runs the x87 at 53-bit precision, where every x87
+operation rounds exactly as its SSE2 double counterpart, so the translation
+computes the same bits. A dispatcher in front of each function sends any caller
+at another precision to the game's own code (the renderer runs at 24 bits; for
+it, a float-only mode translates to single-precision SSE). The repository
+carries only a recipe per function (offsets into the game's code and the
+operations to emit), never the game's bytes; a function whose bytes differ is
+left alone.
+
+With the step length pinned (`EE_SIM_FIXED_MS`), the simulation is fully
+deterministic, which makes the proof exact: a checksum of every unit after each
+step matched the game's own code at all 43 checkpoints of a 2,100-step,
+1,080-unit battle. The same battle at the game's own pacing:
+
+| Heavy battle benchmark, 26 Sep 2026 | x87 (before) | translated |
+|---|---|---|
+| Simulation steps per second | 33 | 50–60 |
+| Time per step (world locked) | 9.0 ms | 5.9 ms |
+| FPS (avg / 10th pct) | 111.7 / 107.4 | 132.7 / 124.9 |
+| Frames of 14 ms or more | 12% | 0.1% |
+| Steps over 25 ms in 80 s (worst) | 17 (67 ms) | 7 (48 ms) |
+
+The cheaper step buys both: the game spends the same share of a CPU on its
+simulation, now in finer steps, and the renderer waits less. The rare long
+frames left are the simulation's own occasional heavy steps (`EE_LOCK_STATS=1`
+logs each one as a "hitch"). `EE_X87T=0` turns the translation off.
 
 ### The bug that blocked this for months
 
@@ -292,7 +331,10 @@ the same value. It plays in matches; the menus have none.
   race in Wine's 32↔64-bit thunks (`wow64cpu.dll+0x123d`/`+0x1139`) — is fixed by
   `patches/wine/patch-wow64cpu.py`, which the installer applies. About one start
   in ten still stalls on the opening banner (the game's own thread stuck in
-  Wine's `DestroyWindow` on a 16×16 test window); the retry covers it. Art of
+  Wine's `DestroyWindow` on a 16×16 test window); the retry covers it. That
+  window belongs to each renderer's 32-bit colour probe, which the game used to
+  repeat for every screen it built; it now runs once per renderer, as the answer
+  cannot change while the game runs (`EE_PROBE_ONCE=0` repeats it). Art of
   Conquest used to stall there on about four starts in ten: its loading banner
   never marks itself painted, so Wine repaints it without end. The base game's
   fix for that now reaches it too (none in eight starts since, 25 Sep 2026).
@@ -356,6 +398,10 @@ committed here.
 | `EE_LOCK_STATS=1` | log the simulation's world-lock timings, tick rate and timers to `ee-version.log` every 10 s |
 | `EE_CALLTIME=<addresses>` | with `EE_LOCK_STATS=1`: time the listed call instructions in the game (diagnostics, see `patches/win32/ee-calltime.h`) |
 | `EE_FUNCTIME=<list>` | with `EE_LOCK_STATS=1`: time whole engine or renderer functions (`lle:<export>`, `tnl:<export>`, `exe:<hex>`), render thread apart from the rest |
+| `EE_X87T=0` | leave the simulation's physics on the x87 (no translation) |
+| `EE_X87T_AOC=1` | also translate Art of Conquest's own physics (not yet checked in play) |
+| `EE_PROBE_ONCE=0` | let the renderers repeat their 32-bit colour probe for every screen they build |
+| `EE_SIM_FIXED_MS=<ms>` | diagnostics: pin the simulation's measured step time, so two runs from one save step identically |
 | `EE_SIMHASH=1` | log a checksum of every unit after each simulation step (compares builds; pins the simulation at its fastest rate) |
 | `EE_PHYSICS_SHARE=<percent>` | the share of a CPU the simulation may use (the game's own is 30): higher steps units more finely, at the cost of FPS |
 | `EE_DDRAW_PAGES=0` | stop the proxy's page flipping (brings back the menu cursor trails) |

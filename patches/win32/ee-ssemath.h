@@ -304,15 +304,13 @@ static const struct { const char *fn; unsigned short off; } g_ssem_fields[] = {
  * each call in g_ssem_calls and each g_ssem_fields displacement are zeroed as
  * well: where a call lands depends on the DLL's layout, and ssem_prepare checks
  * every one of them against the callee itself. */
-static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len, const char *name) {
+/* buf holds the len bytes at base+rva: replace each relocated dword in it by
+ * the four bytes it points at (import-table slots by zero). */
+static void ssem_subst(unsigned char *buf, const unsigned char *base, DWORD rva, unsigned len) {
   const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
   const IMAGE_DATA_DIRECTORY *rd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
   const IMAGE_DATA_DIRECTORY *iat = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
   const DWORD image = nt->OptionalHeader.SizeOfImage;
-  unsigned char buf[1024];
-  if (len > sizeof buf)
-    return 0;
-  memcpy(buf, base + rva, len);
   if (rd->VirtualAddress && rd->Size) {
     const unsigned char *p = base + rd->VirtualAddress, *end = p + rd->Size;
     while (p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
@@ -341,6 +339,14 @@ static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len, co
       p += br->SizeOfBlock;
     }
   }
+}
+
+static unsigned ssem_hash(const unsigned char *base, DWORD rva, unsigned len, const char *name) {
+  unsigned char buf[1024];
+  if (len > sizeof buf)
+    return 0;
+  memcpy(buf, base + rva, len);
+  ssem_subst(buf, base, rva, len);
   if (name) {
     unsigned k;
     for (k = 0; k < sizeof g_ssem_calls / sizeof g_ssem_calls[0]; k++)

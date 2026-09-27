@@ -1773,6 +1773,19 @@ static HRESULT STDMETHODCALLTYPE hook_DevBeginScene(IDirect3DDevice7 *this) {
       InterlockedIncrement(&g_ft[b]);
       if (us > g_ft_max)
         g_ft_max = us;
+      if (us > 40000) { /* hitches (EE_LOCK_STATS=1): ee-version logs long world holds on the same clock */
+        static int on = -1, n;
+        if (on < 0) {
+          char e[8];
+          on = GetEnvironmentVariableA("EE_LOCK_STATS", e, sizeof e) > 0 && e[0] == '1';
+        }
+        if (on && n++ < 200) {
+          LARGE_INTEGER now, f;
+          QueryPerformanceCounter(&now);
+          QueryPerformanceFrequency(&f);
+          ee_log("hitch: frame took %.1f ms (qpc %.3f s)", us / 1000.0, (double)now.QuadPart / (double)f.QuadPart);
+        }
+      }
     }
     QueryPerformanceCounter(&prev);
   }

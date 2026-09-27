@@ -12,6 +12,10 @@
 #include <mmsystem.h>
 #include "ee-ssemath.h"
 #include "ee-calltime.h"
+#include "ee-x87t.h"
+#ifdef EE_X87T_SELFTEST /* a test build only: diagnostics/x87t-selftest.sh */
+#include "x87t-selftest.h"
+#endif
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -512,9 +516,89 @@ static void patch_crt(HMODULE mod) {
   patch_iat(mod, "MSVCP60.dll", "raise", (void *)hook_raise);
 }
 
+/* ---- DX7Screen's 32-bit probe, once per renderer -----------------------------
+ * Every DX7Screen the renderers build -- a dozen per start: each renderer, each
+ * plugin scan -- probes the Direct3D device from its constructor (+0x179): a
+ * 16x16 window, a DirectDraw device through D7VK, the device caps, a Z-buffer
+ * test surface.  Then it destroys the window, and that DestroyWindow is where
+ * the base game's rare start-up stall sits (winemac waiting on the Cocoa main
+ * thread).  Its only result is two flag bytes, this+0x41 (a caps bit) and +0x42
+ * (a usable Z format): facts about the Mac's graphics stack.  So the first
+ * probe of each renderer runs, and later ones copy its answer.  Same code in
+ * all four renderers (both games).  EE_PROBE_ONCE=0 probes every time. */
+static struct {
+  int have;
+  unsigned char f41, f42;
+} g_probe_ans[2];                     /* 0: DX7HRTnLDisplay, 1: DX7HRDisplay */
+static unsigned char *g_probe_tramp;  /* two trampolines, 32 bytes apart, in an RX page */
+static void __cdecl ee_probe_run(int k, unsigned char *self) {
+  if (g_probe_ans[k].have) {
+    self[0x41] = g_probe_ans[k].f41;
+    self[0x42] = g_probe_ans[k].f42;
+    return;
+  }
+  ((void(__attribute__((thiscall)) *)(unsigned char *))(void *)(g_probe_tramp + 32 * k))(self);
+  g_probe_ans[k].f41 = self[0x41];
+  g_probe_ans[k].f42 = self[0x42];
+  g_probe_ans[k].have = 1;
+}
+static void __attribute__((thiscall)) ee_probe_tnl(unsigned char *self) { ee_probe_run(0, self); }
+static void __attribute__((thiscall)) ee_probe_hw(unsigned char *self) { ee_probe_run(1, self); }
+
+static void probe_once_install(HMODULE mod) {
+  static const unsigned char head[9] = {0x55, 0x8b, 0xec, 0x81, 0xec, 0x80, 0x01, 0x00, 0x00}; /* sub esp,0x180 */
+  static const unsigned char after[5] = {0x8d, 0x45, 0x18, 0x50, 0xb9};
+  unsigned char *ctor = (unsigned char *)GetProcAddress(
+      mod, "??0DX7Screen@@AAE@PAUHMONITOR__@@PAUIDirectDraw7@@ABVUString@@_N3@Z");
+  unsigned char *at, *probe, *t;
+  char path[MAX_PATH], b[8];
+  DWORD old;
+  int rel, k;
+  unsigned i;
+  if (GetEnvironmentVariableA("EE_PROBE_ONCE", b, sizeof b) > 0 && b[0] == '0')
+    return;
+  at = ctor ? ctor + 0x179 : NULL; /* mov ecx,esi / call probe / lea eax,[ebp+0x18] / push eax / mov ecx,.. */
+  if (!at || IsBadReadPtr(at - 2, 12) || at[-2] != 0x8b || at[-1] != 0xce || at[0] != 0xE8 || memcmp(at + 5, after, 5))
+    return;
+  memcpy(&rel, at + 1, 4);
+  probe = at + 5 + rel;
+  if (IsBadReadPtr(probe, 9) || memcmp(probe, head, 9))
+    return; /* not the probe, or already ours */
+  GetModuleFileNameA(mod, path, sizeof path);
+  for (i = 0; path[i]; i++)
+    if (path[i] >= 'A' && path[i] <= 'Z')
+      path[i] = (char)(path[i] - 'A' + 'a');
+  k = strstr(path, "tnl") ? 0 : 1;
+  if (!g_probe_tramp &&
+      !(g_probe_tramp = (unsigned char *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ)))
+    return;
+  /* the trampoline: the probe's first 9 bytes, then jmp back past them (rebuilt
+   * whenever the renderer is loaded again, maybe somewhere else) */
+  t = g_probe_tramp + 32 * k;
+  VirtualProtect(g_probe_tramp, 4096, PAGE_READWRITE, &old);
+  memcpy(t, head, 9);
+  t[9] = 0xE9;
+  rel = (int)((probe + 9) - (t + 14));
+  memcpy(t + 10, &rel, 4);
+  VirtualProtect(g_probe_tramp, 4096, PAGE_EXECUTE_READ, &old);
+  if (!VirtualProtect(probe, 5, PAGE_EXECUTE_READWRITE, &old))
+    return;
+  probe[0] = 0xE9;
+  rel = (int)((unsigned char *)(k ? (void *)ee_probe_hw : (void *)ee_probe_tnl) - (probe + 5));
+  memcpy(probe + 1, &rel, 4);
+  VirtualProtect(probe, 5, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+  {
+    static int logged[2];
+    if (!logged[k]++)
+      ee_log("renderer: DX7Screen's 32-bit probe runs once per renderer (module %p)", (void *)mod);
+  }
+}
+
 static void patch_rasterizer(HMODULE mod) {
   if (!mod)
     return;
+  probe_once_install(mod);
   if (g_ee_exe) {
     patch_iat(mod, "user32.dll", "CreateWindowExA", (void *)hook_CreateWindowExA);
     patch_iat(mod, "user32.dll", "AdjustWindowRect", (void *)hook_AdjustWindowRect);
@@ -1087,6 +1171,15 @@ static void __attribute__((thiscall)) ls_wunlock(void *self) {
   if (held > ls_hold_max)
     ls_hold_max = held;
   tr_wunlock(self);
+  if (held > 25000) { /* hitches: every long hold, on the same clock as ee-ddraw's long frames */
+    static LONG n;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    if (InterlockedIncrement(&n) <= 200)
+      ee_log("hitch: the world held %.1f ms by thread %04lx from %p (qpc %.3f s)", held / 1000.0,
+             (unsigned long)GetCurrentThreadId(), ls_cur_site >= 0 ? ls_site[ls_cur_site].ra : NULL,
+             (double)t.QuadPart / (double)f.QuadPart);
+  }
   if ((LONG)(now - ls_next) >= 0) {
     LONG w = InterlockedExchange(&ls_writes, 0), h = InterlockedExchange(&ls_hold_us, 0), m = InterlockedExchange(&ls_hold_max, 0);
     LONG r = InterlockedExchange(&ls_reads, 0), rw = InterlockedExchange(&ls_rwait_us, 0), ww = InterlockedExchange(&ls_wwait_us, 0);
@@ -1131,6 +1224,14 @@ static void __attribute__((thiscall)) ls_rlock(void *self) {
   us = ls_us(a, b);
   InterlockedExchangeAdd(&ls_rwait_us, us);
   InterlockedIncrement(&ls_reads);
+  if (us > 25000 && __builtin_return_address(0) == (void *)0x4feda6) {
+    static LONG n;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    if (InterlockedIncrement(&n) <= 200)
+      ee_log("hitch: the render thread waited %.1f ms for the world (qpc %.3f s)", us / 1000.0,
+             (double)b.QuadPart / (double)f.QuadPart);
+  }
   for (i = 0; i < 8; i++)
     if (ls_rd[i].tid == t || InterlockedCompareExchange(&ls_rd[i].tid, t, 0) == 0) {
       void *ra = __builtin_return_address(0);
@@ -1376,11 +1477,25 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved) {
         ee_log("sse maths: %d of %d engine functions redirected to SSE2 (x87 control word 0x%04x at start)",
                ee_ssemath_install(lle, ee_log), SSEM_N, ssem_cw());
     }
+#ifdef EE_X87T_SELFTEST
+    TerminateProcess(GetCurrentProcess(), x87t_selftest(ee_log) ? 1 : 0);
+#endif
     install_render_sleep();
+    /* The game's physics on SSE2 (ee-x87t.h; EE_X87T=0 turns it off), from the
+     * host exe's table and the engine's, each function only where its bytes
+     * match.  Art of Conquest's own table waits for its in-game checksum run
+     * (EE_X87T_AOC=1 turns it on); the engine's functions are value-checked in
+     * both games. */
+    {
+      char b[8];
+      int aoc = GetEnvironmentVariableA("EE_X87T_AOC", b, sizeof b) > 0 && b[0] == '1';
+      x87t_install(g_ee_exe ? x87t_fns : aoc ? x87t_aoc_fns : NULL, GetModuleHandleA("Low-Level Engine.dll"), ee_log);
+    }
     install_lock_stats(GetModuleHandleA("Low-Level Engine.dll"));
     ct_install(ee_log); /* EE_CALLTIME (with EE_LOCK_STATS=1): see ee-calltime.h */
     sh_install(ee_log); /* EE_SIMHASH=1: per-tick world checksum, see ee-calltime.h */
     share_install(ee_log); /* EE_PHYSICS_SHARE=<percent> */
+    fixed_install(GetModuleHandleA("Low-Level Engine.dll"), ee_log); /* EE_SIM_FIXED_MS=<ms> */
     ft_install("lle", GetModuleHandleA("Low-Level Engine.dll"), ee_log); /* EE_FUNCTIME */
     ft_install("exe", NULL, ee_log);
     load_real();

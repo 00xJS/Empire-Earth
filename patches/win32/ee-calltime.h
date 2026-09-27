@@ -359,10 +359,11 @@ static void sh_install(void (*logf)(const char *fmt, ...)) {
  * takes: ticks/s = floor(10 * share / average tick ms), capped at 30, with
  * share = 30 -- the percentage of one CPU the simulation may use, a 2001
  * single-core budget (NESynchronousServer::TuneForSlowCPU; the value is read
- * once, when the server is made, at 0x4c253b: mov eax,[0x919424]).  Each tick
- * moves the world a fixed step, so fewer ticks per second is a slower game.
- * This makes that read a constant.  EE_SIMHASH=1 pins it at 100 (always 30
- * ticks/s) so two runs cut the same ticks into the same command turns. */
+ * once, when the server is made, at 0x4c253b: mov eax,[0x919424]).  The rate
+ * is capped by the server (about 125); the step per tick follows it, so the
+ * game's speed stays the same.  This makes that read a constant.  EE_SIMHASH=1
+ * pins it at 100; runs still part as soon as their tick times differ, which
+ * EE_SIM_FIXED_MS (below) takes away. */
 static void share_install(void (*logf)(const char *fmt, ...)) {
   static const unsigned char want[5] = {0xA1, 0x24, 0x94, 0x91, 0x00};
   unsigned char *at = (unsigned char *)0x4c253b;
@@ -387,6 +388,36 @@ static void share_install(void (*logf)(const char *fmt, ...)) {
   VirtualProtect(at, 5, old, &old);
   FlushInstructionCache(GetCurrentProcess(), at, 5);
   logf("physics share: %d%% of a CPU (the game's is 30%%)", pct);
+}
+
+/* ---- fixed tick time (EE_SIM_FIXED_MS=<ms>, diagnostics) --------------------
+ * TuneForSlowCPU sets the rate from the measured average tick time, so two runs
+ * from one save step the world differently and their EE_SIMHASH checksums part
+ * as soon as a tick takes longer in one of them.  This pins the average it
+ * reads (the "if 0 then 1" after the averager, +0x2c) at <ms>: a fixed rate and
+ * step, so rewritten game code can be compared with the original tick for
+ * tick.  With EE_SIMHASH=1 (share 100), 33 gives the usual 30 ticks/s.  Both
+ * games' engines carry the same bytes. */
+static void fixed_install(HMODULE lle, void (*logf)(const char *fmt, ...)) {
+  static const unsigned char want[13] = {0x33, 0xff, 0x66, 0x3b, 0xc7, 0x75, 0x03, 0x6a, 0x01, 0x58, 0x0f, 0xb7, 0xc0};
+  unsigned char *fn = lle ? (unsigned char *)GetProcAddress(lle, "?TuneForSlowCPU@NESynchronousServer@@AAE_NXZ") : NULL;
+  char b[16];
+  int ms;
+  DWORD old;
+  if (GetEnvironmentVariableA("EE_SIM_FIXED_MS", b, sizeof b) <= 0 || (ms = atoi(b)) <= 0)
+    return;
+  if (ms > 1000)
+    ms = 1000;
+  if (!fn || IsBadReadPtr(fn + 0x27, sizeof want) || memcmp(fn + 0x27, want, sizeof want)) {
+    logf("fixed tick: TuneForSlowCPU is not the reversed code -- left alone");
+    return;
+  }
+  VirtualProtect(fn + 0x2c, 5, PAGE_EXECUTE_READWRITE, &old);
+  fn[0x2c] = 0xB8; /* mov eax, ms -- was jne +3 / push 1 / pop eax */
+  memcpy(fn + 0x2d, &ms, 4);
+  VirtualProtect(fn + 0x2c, 5, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), fn + 0x2c, 5);
+  logf("fixed tick: TuneForSlowCPU sees %d ms a tick (EE_SIM_FIXED_MS)", ms);
 }
 
 /* ---- function timing (EE_FUNCTIME, diagnostics) -----------------------------
